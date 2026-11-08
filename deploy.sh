@@ -75,9 +75,10 @@ fi
 if [[ $BUILD -eq 1 ]]; then
   log "构建镜像（控制机，node:22-alpine + npmmirror）"
   docker build -f "$DOCKERFILE" -t "$IMAGE" .
-  # 构建产物自检：确保自托管补丁确实进了镜像
+  # 构建产物自检：确保自托管补丁确实进了镜像（saveWebSession=30 天滑动会话，
+  # removeMatch=设备移除/恢复，均为本仓库独有；spaRoute=上游 0.6.4 的 SPA 回退）
   docker run --rm --entrypoint sh "$IMAGE" -c \
-    "grep -q 'devices/rename' dist/server.js && grep -q \"startsWith('/app/')\" dist/server.js" \
+    "grep -q 'saveWebSession' dist/server.js && grep -q 'removeMatch' dist/server.js && grep -q 'spaRoute' dist/server.js" \
     || die "镜像自检失败：自托管补丁不在 dist/server.js 里"
   log "镜像自检通过"
 fi
@@ -124,7 +125,7 @@ if [[ $VERIFY -eq 1 ]]; then
   asset="$(curl -sS -m 15 "$PUBLIC_URL/" | grep -o 'assets/index-[^"]*\.js' | head -1 || true)"
   if [[ -n "$asset" ]]; then
     curl -sS -m 20 "$PUBLIC_URL/$asset" -o /tmp/dsh-remote-asset.$$.js
-    if grep -q 'devices/rename' /tmp/dsh-remote-asset.$$.js; then
+    if grep -q '移除设备' /tmp/dsh-remote-asset.$$.js; then
       printf '   %-14s %s（含自托管补丁）\n' "$asset" ok
     else
       printf '   %-14s %s（缺少自托管补丁！）\n' "$asset" FAIL

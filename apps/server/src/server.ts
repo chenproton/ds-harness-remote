@@ -8,17 +8,20 @@ import { z } from 'zod'
 import { deviceRegistrationRequestSchema, deviceRefreshRequestSchema, MAX_DEVICE_NAME_LENGTH } from '@dsh-remote/protocol'
 import { ApiError, Store, equal, hash, secret } from './store.js'
 import { Gateway } from './gateway.js'
+import { buildIceServers, parseIceConfig, type IceConfig } from './ice.js'
 import { Logger, type LogLevel } from './logger.js'
 import {
   FORCE_TERMINATE_GRACE_MS_RANGE,
   HEARTBEAT_DISCONNECT_MS_MAX,
   HELLO_TIMEOUT_MS_RANGE,
   HEARTBEAT_INTERVAL_MS_RANGE,
+  MAX_FRAMES_PER_SEC_RANGE,
   normalizeForceTerminateGraceMs,
   normalizeGatewayOptions,
   normalizeHeartbeatDisconnectMs,
   normalizeHeartbeatIntervalMs,
   normalizeHelloTimeoutMs,
+  normalizeMaxFramesPerSec,
 } from './config.js'
 
 export interface Config {
@@ -31,7 +34,9 @@ export interface Config {
   heartbeatIntervalMs?: number
   heartbeatDisconnectMs?: number
   forceTerminateGraceMs?: number
+  maxFramesPerSec?: number
   logLevel?: LogLevel
+  ice?: IceConfig
 }
 
 /**
@@ -56,21 +61,26 @@ export function parseForceTerminateGrace(val: string | undefined): number {
   return normalizeForceTerminateGraceMs(val)
 }
 
+export function parseMaxFramesPerSec(val: string | undefined): number {
+  return normalizeMaxFramesPerSec(val)
+}
+
 export {
   normalizeGatewayOptions,
   normalizeHelloTimeoutMs,
   normalizeHeartbeatIntervalMs,
   normalizeHeartbeatDisconnectMs,
   normalizeForceTerminateGraceMs,
+  normalizeMaxFramesPerSec,
   HELLO_TIMEOUT_MS_RANGE,
   HEARTBEAT_INTERVAL_MS_RANGE,
   HEARTBEAT_DISCONNECT_MS_MAX,
   FORCE_TERMINATE_GRACE_MS_RANGE,
+  MAX_FRAMES_PER_SEC_RANGE,
 }
 export type { GatewayTimingOptions, NormalizedGatewayOptions } from './config.js'
 
 const loginSchema = z.object({ email: z.string().min(1).max(254), password: z.string().min(1).max(1024) }).strict()
-const renameSchema = z.object({ deviceId: z.string().min(1).max(128), name: z.string().max(MAX_DEVICE_NAME_LENGTH) }).strict()
 // Self-host patch: 30-day sliding web sessions (persisted in the store) so the console stays signed in.
 const WEB_SESSION_MS = 30 * 86400_000
 const publicDir = fileURLToPath(new URL('../dist/public/', import.meta.url))
@@ -157,6 +167,7 @@ export function createRemoteServer(config: Config) {
   const url = new URL(config.publicUrl)
   if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.pathname !== '/' || url.search || url.hash) throw new Error('DSH_SERVER_PUBLIC_URL must be an HTTP(S) origin.')
   const trustedProxyIps = normalizeTrustedProxyIps(config.trustedProxyIps)
+  const ice = config.ice ?? parseIceConfig({})
   const store = new Store(config.dataFile, config.account.trim(), config.password)
   const assets = readAssets()
   const limits = new Map<string, { count: number; until: number }>()
@@ -206,24 +217,30 @@ export function createRemoteServer(config: Config) {
   })
   const gateway = new Gateway(server, store, url.origin, {
     ...timing,
+    maxFramesPerSec: normalizeMaxFramesPerSec(config.maxFramesPerSec),
     logLevel: config.logLevel,
     logger: logger.child('gateway'),
+    turnEnabled: ice.turnUrls.length > 0,
   })
   function descriptor(d: ReturnType<Store['get']>) {
     return { ...d.descriptor, membershipId: `account:${hash(store.account).slice(0, 16)}`, online: gateway.peers.has(d.descriptor.deviceId), lastSeenAt: d.lastSeenAt }
   }
   async function route(req: IncomingMessage, res: ServerResponse) {
-    const path = new URL(req.url ?? '/', url).pathname
+    const requestUrl = new URL(req.url ?? '/', url)
+    const path = requestUrl.pathname
     const method = req.method
     if (req.headers.origin && req.headers.origin !== url.origin) throw new ApiError('AUTH_INVALID', 403)
     if (req.headers['sec-fetch-site'] === 'cross-site') throw new ApiError('AUTH_INVALID', 403)
     const staticAsset = path.startsWith('/assets/') || ['/icon.png', '/brand-whale.webp', '/landing-atmosphere.webp'].includes(path)
-    // SPA fallback: any /app/* route (e.g. /app/remote) serves index.html so browser refresh works.
-    if (method === 'GET' && (path === '/' || path === '/app' || path.startsWith('/app/') || staticAsset)) {
+    // SPA fallback: any GET that is not API / WebSocket / health-check returns index.html.
+    // Without this, refreshing a client route such as /app/remote hits the unknown-method branch and yields METHOD_NOT_FOUND.
+    const spaRoute = method === 'GET' && !staticAsset && !path.startsWith('/api/') && !path.startsWith('/ws/') && !['/health', '/healthz', '/ready'].includes(path)
+    if (method === 'GET' && (spaRoute || staticAsset)) {
       const name = staticAsset ? path.slice(1) : 'index.html'
       const asset = assets.get(name)
       if (!asset) throw new ApiError('METHOD_NOT_FOUND', 404)
       const contentType = name.endsWith('.js') ? 'text/javascript; charset=utf-8' : name.endsWith('.css') ? 'text/css; charset=utf-8' : name.endsWith('.png') ? 'image/png' : name.endsWith('.webp') ? 'image/webp' : 'text/html; charset=utf-8'
+      if (!staticAsset) res.setHeader('Cache-Control', 'no-cache')
       res.setHeader('Content-Type', contentType)
       res.end(asset); return
     }
@@ -244,15 +261,7 @@ export function createRemoteServer(config: Config) {
       store.deleteWebSession(hash(token(req))); res.setHeader('Set-Cookie', cookie('', 0)); json(res, 200, { status: 'ok' }); return
     }
     if (method === 'GET' && path === '/api/v1/account/devices') {
-      accountAuth(req); json(res, 200, { items: store.list().map(descriptor), serverUrl: url.origin, transport: 'relay' }); return
-    }
-    if (method === 'POST' && path === '/api/v1/devices/rename') {
-      accountAuth(req)
-      const { deviceId, name } = renameSchema.parse(await body(req))
-      const trimmed = name.trim()
-      if (!trimmed) throw new ApiError('INVALID_MESSAGE', 400)
-      store.rename(deviceId, trimmed)
-      json(res, 200, { status: 'ok', name: trimmed }); return
+      accountAuth(req); json(res, 200, { items: store.list().map(descriptor), serverUrl: url.origin, transport: 'webrtc' }); return
     }
     if (method === 'POST' && (path === '/api/v1/devices/register' || path === '/api/v1/devices/register-owned-role')) {
       // /register accepts EITHER an account session (any role) or a device access token
@@ -288,6 +297,13 @@ export function createRemoteServer(config: Config) {
       json(res, 200, { status: 'revoked' }); return
     }
     if (method === 'GET' && path === '/api/v1/me') { json(res, 200, descriptor(deviceAuth(req))); return }
+    if (method === 'GET' && path === '/api/v1/turn/credentials') {
+      const source = deviceAuth(req)
+      const connectionId = requestUrl.searchParams.get('connection_id') ?? ''
+      if (!connectionId || connectionId.length > 128) throw new ApiError('INVALID_MESSAGE')
+      if (!gateway.authorizeIce(source.descriptor.deviceId, connectionId)) throw new ApiError('CONNECTION_NOT_FOUND', 404)
+      json(res, 200, { iceServers: buildIceServers(ice, source.descriptor.deviceId) }); return
+    }
     if (method === 'GET' && path === '/api/v1/devices') {
       const source = deviceAuth(req)
       if (source.descriptor.role !== 'client') throw new ApiError('MEMBERSHIP_REQUIRED', 403)
@@ -296,6 +312,13 @@ export function createRemoteServer(config: Config) {
         return item
       })
       json(res, 200, { items, nextCursor: null }); return
+    }
+    const renameMatch = /^\/api\/v1\/devices\/([^/]+)\/name$/.exec(path)
+    if (method === 'POST' && renameMatch) {
+      accountAuth(req)
+      const { name } = z.object({ name: z.string().trim().min(1).max(80) }).parse(await body(req))
+      store.rename(renameMatch[1]!, name)
+      json(res, 200, descriptor(store.get(renameMatch[1]!))); return
     }
     const match = /^\/api\/v1\/devices\/([^/]+)(\/presence)?$/.exec(path)
     if (method === 'GET' && match) {

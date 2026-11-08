@@ -5,8 +5,10 @@ import {
   parseHeartbeatInterval,
   parseHeartbeatDisconnect,
   parseForceTerminateGrace,
+  parseMaxFramesPerSec,
 } from './server.js'
 import { parseLogLevel } from './logger.js'
+import { parseIceConfig } from './ice.js'
 
 const port = Number(process.env.DSH_SERVER_PORT ?? '8080')
 if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Invalid DSH_SERVER_PORT.')
@@ -15,6 +17,7 @@ const heartbeatIntervalMs = parseHeartbeatInterval(process.env.DSH_SERVER_HEARTB
 const heartbeatDisconnectMs = parseHeartbeatDisconnect(process.env.DSH_SERVER_HEARTBEAT_DISCONNECT_MS, heartbeatIntervalMs)
 const helloTimeoutMs = parseHelloTimeout(process.env.DSH_SERVER_HELLO_TIMEOUT_MS)
 const forceTerminateGraceMs = parseForceTerminateGrace(process.env.DSH_SERVER_FORCE_TERMINATE_GRACE_MS)
+const maxFramesPerSec = parseMaxFramesPerSec(process.env.DSH_SERVER_MAX_FRAMES_PER_SEC)
 const logLevel = parseLogLevel(process.env.DSH_SERVER_LOG_LEVEL)
 
 const app = createRemoteServer({
@@ -27,7 +30,9 @@ const app = createRemoteServer({
   heartbeatIntervalMs,
   heartbeatDisconnectMs,
   forceTerminateGraceMs,
+  maxFramesPerSec,
   logLevel,
+  ice: parseIceConfig(process.env),
 })
 app.server.listen(port, process.env.DSH_SERVER_HOST ?? '127.0.0.1', () => console.info(`Remote Server listening on port ${port}`))
 app.server.on('error', () => { console.error('Remote Server could not listen. Check address and port.'); process.exitCode = 1; app.gateway.close() })

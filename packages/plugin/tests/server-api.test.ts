@@ -59,6 +59,16 @@ describe('HostServerApi', () => {
       }
     } })))
   })
+  it('enables device pairing only for an explicit supported server capability', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dsh-pairing-discovery-'))
+    directories.push(directory)
+    for (const capability of [undefined, false, 'dsh-pairing-v2', 'dsh-pairing-v1']) {
+      const api = new HostServerApi('https://dsh.r2049.cn', new ServerCredentialStore(directory),
+        vi.fn(async () => json({ items: [], capabilities: { devicePairing: capability } })) as unknown as typeof fetch)
+      expect((await api.oauthProviders()).some(item => item.devicePairing === true)).toBe(capability === 'dsh-pairing-v1')
+    }
+  })
+
   it('discovers future providers and uses their advertised QR entry without account credentials', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'dsh-oauth-discovery-'))
     directories.push(directory)
@@ -440,6 +450,40 @@ describe('HostServerApi', () => {
     await expect(api.authenticate(hostIdentity())).rejects.toMatchObject({ code: 'ACCOUNT_AUTH_REQUIRED', retryable: false })
   })
 
+  it('reads all membership pages, supports legacy Servers and rejects broken continuations', async () => {
+    const host = (id: number) => ({ deviceId: `host-${id}`, role: 'host', name: `Host ${id}`, platform: 'linux', membershipId: `member-${id}` })
+    await runScenarios([
+      { name: 'multiple pages', bodies: [{ items: [host(0)], nextCursor: 'cursor+/=' }, { items: [host(1)], nextCursor: null }], count: 2 },
+      { name: 'legacy ignores limit', bodies: [{ items: Array.from({ length: 301 }, (_, i) => host(i)) }], count: 301 },
+      { name: 'empty list', bodies: [{ items: [], nextCursor: null }], count: 0 },
+      { name: 'repeated cursor', bodies: [{ items: [host(0)], nextCursor: 'same' }, { items: [host(1)], nextCursor: 'same' }] },
+      { name: 'invalid cursor type', bodies: [{ items: [host(0)], nextCursor: 42 }] },
+      { name: 'empty continuation', bodies: [{ items: [], nextCursor: 'next' }] },
+      { name: 'duplicate device', bodies: [{ items: [host(0)], nextCursor: 'next' }, { items: [host(0)], nextCursor: null }] },
+    ].map(scenario => ({ name: scenario.name, run: async () => {
+      const directory = await mkdtemp(join(tmpdir(), 'dsh-device-pages-'))
+      directories.push(directory)
+      const identity = hostIdentity(), store = new ServerCredentialStore(directory)
+      const origin = 'https://example.invalid'
+      await store.save({ serverUrl: origin, deviceId: identity.deviceId, authorizationMethod: 'account', ...tokens() })
+      let index = 0
+      const fetchMock = vi.fn<typeof fetch>(async input => {
+        const url = new URL(String(input))
+        expect(url.pathname).toBe('/api/v1/devices')
+        expect(url.searchParams.get('limit')).toBe('50')
+        expect(url.searchParams.get('cursor')).toBe(index === 0 ? null : (scenario.bodies[index - 1] as { nextCursor?: unknown }).nextCursor)
+        return json(scenario.bodies[index++]!)
+      })
+      const api = new ClientServerApi(origin, store, fetchMock)
+      api.bindIdentity(identity)
+      try {
+        if (scenario.count === undefined) await expect(api.listDevices()).rejects.toMatchObject({ code: 'INVALID_MESSAGE' })
+        else expect(await api.listDevices()).toHaveLength(scenario.count)
+        expect(fetchMock).toHaveBeenCalledTimes(scenario.bodies.length)
+      } finally { api.close() }
+    } })), cleanupContract1)
+  })
+
   it('refreshes a server-rejected access token once for a read before requiring a login', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'dsh-client-read-refresh-'))
     directories.push(directory)
@@ -765,6 +809,7 @@ it('uses newly saved credentials after a delayed refresh rejection without retry
 
 it('retries unstructured authorization responses but preserves explicit protocol rejections', async () => {
   const responses = [
+    { name: 'rate limit with revoked code', status: 429, body: JSON.stringify({ error: { code: 'DEVICE_REVOKED', message: 'Retry later', retryable: false } }), limited: true },
     { name: 'HTML 401', status: 401, body: '<html>gateway challenge</html>', reason: 'invalid_json' },
     { name: 'empty 401', status: 401, body: '', reason: 'invalid_error_envelope' },
     { name: 'gateway JSON 401', status: 401, body: '{"detail":"gateway unavailable"}', reason: 'invalid_error_envelope' },
@@ -787,7 +832,7 @@ it('retries unstructured authorization responses but preserves explicit protocol
       .mockResolvedValueOnce(json(tokens({ refreshToken: 'recovered-refresh-value' })))
     const api = new HostServerApi('https://dsh.r2049.cn', store, fetchMock)
     await expect(api.authenticate(identity)).rejects.toMatchObject({
-      code: row.terminal ?? 'CONNECTION_FAILED', retryable: row.terminal === undefined,
+      code: row.terminal ?? (row.limited ? 'RATE_LIMITED' : 'CONNECTION_FAILED'), retryable: row.terminal === undefined,
       status: row.status, phase: 'credential_refresh', reason: row.reason ?? 'http_error',
     })
     expect(await store.load('https://dsh.r2049.cn', identity.deviceId)).toEqual(initial)

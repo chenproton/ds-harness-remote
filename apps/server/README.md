@@ -2,13 +2,19 @@
 
 **English** · [中文](README.zh.md)
 
-A single-account Remote relay with credentials configured through environment variables. Its Web UI includes a landing page, sign-in, and device status page. The Server is deployed separately from the Host plugin bundle.
+A single-account Remote Server with WebRTC (LAN / P2P / TURN) and end-to-end encrypted Relay, configured through environment variables. Its Web UI includes a landing page, sign-in, and device status page. The Server is deployed separately from the Host plugin bundle.
 
 This remains a small self-hosted Server that we intend to maintain. The product shape of the full Server Web is still evolving, so this repository does not promise to open source the current or future full site.
 
 ## Self-hosted Web flow
 
 The `/` landing page links to `/app/login`; a successful sign-in continues to `/app/remote`. Point both Host and Client at the same Server URL and use the same account and password. Device credentials are persisted by the Server, while Web sessions use an HttpOnly cookie.
+
+## Refresh response recovery
+
+If a refresh succeeds but its response is lost, retrying the previous refresh token returns the same successor pair, including after a Server restart. Recovery remains available until that successor is rotated again, revoked, or expired; it does not extend either token's lifetime. An expired recovered access token can be replaced by rotating the recovered refresh token. Older tokens are rejected without revoking current credentials.
+
+Existing device state remains compatible. Tokens already consumed before this Server upgrade have no recovery metadata and cannot be recovered. Revoked or expired credentials still require sign-in. Updating the Plugin alone does not add this Server behavior. Recovery metadata contains no plaintext bearer tokens; see [the refresh protocol](../../docs/protocol.md#82-refresh).
 
 ## Docker deployment
 
@@ -74,8 +80,27 @@ Open <http://localhost:8080>. Set the same Server URL on your Host and Client, t
 | `DSH_SERVER_PORT` | Default `8080` |
 | `DSH_SERVER_DATA_FILE` | Default `data/state.json`, relative to the working directory |
 | `DSH_SERVER_TRUSTED_PROXY_IPS` | Comma-separated trusted reverse-proxy peer IPs; empty (default) disables forwarded-IP handling |
+| `DSH_SERVER_STUN_URLS` | Comma-separated STUN URLs handed to Host/Client; empty (default) keeps host candidates only |
+| `DSH_SERVER_TURN_URLS` | Comma-separated TURN URLs; requires `DSH_SERVER_TURN_SECRET` or `DSH_SERVER_TURN_USERNAME` + `DSH_SERVER_TURN_PASSWORD` |
+| `DSH_SERVER_TURN_SECRET` | coturn REST API shared secret; never sent to clients |
+| `DSH_SERVER_TURN_USERNAME` | Static TURN username for deployments that cannot use a shared secret; mutually exclusive with `DSH_SERVER_TURN_SECRET` |
+| `DSH_SERVER_TURN_PASSWORD` | Static TURN password; must be set together with `DSH_SERVER_TURN_USERNAME` |
+| `DSH_SERVER_TURN_TTL_SECONDS` | TURN credential lifetime in seconds, 60–3600, default `300` (applies to short-lived credentials only) |
 
 For public access, use an HTTPS reverse proxy and set `DSH_SERVER_PUBLIC_URL` to your domain. The proxy must support WebSocket Upgrade at `/ws/v1/connect` with an idle timeout above 75 seconds.
+
+## WebRTC and TURN
+
+The Server coordinates the same four paths as the hosted Server: `LAN -> P2P -> TURN -> Relay`.
+
+- It forwards WebRTC `signal.offer` / `signal.answer` / `signal.ice` between the two devices of an authorized connection, and forwards the initiator's `transport.selected` (including the legacy `lan -> p2p` downgrade for older Hosts).
+- It issues short-lived STUN/TURN servers through `GET /api/v1/turn/credentials` only to the two devices of an establishing connection. TURN credentials use the coturn REST API: `username=<expiryUnixSeconds>:<deviceId>`, `credential=base64(HMAC-SHA1(secret, username))`.
+- It never sees or decrypts session traffic: WebRTC carries Noise ciphertext directly, TURN only forwards WebRTC packets, and Relay forwards ciphertext over WebSocket.
+- When WebRTC or TURN is unavailable, Clients fall back to the encrypted Relay automatically. Leaving `DSH_SERVER_STUN_URLS` / `DSH_SERVER_TURN_URLS` empty keeps the Relay-only behavior.
+
+Deploy coturn separately with `use-auth-secret` and `static-auth-secret` matching `DSH_SERVER_TURN_SECRET`, open the TURN ports (normally 3478/UDP and TCP plus a relay port range), and point the STUN/TURN URLs at addresses reachable from the Host and Client. The HTTPS reverse proxy is only needed for the control WebSocket and REST API; WebRTC and TURN traffic do not pass through it.
+
+For a TURN deployment that cannot use a shared secret, set `DSH_SERVER_TURN_USERNAME` + `DSH_SERVER_TURN_PASSWORD` instead of `DSH_SERVER_TURN_SECRET` (never both); the Server then hands the static pair to connection participants. Prefer short-lived REST API credentials — static ones are shared by every connection until rotated.
 
 ### Rate limiting behind a reverse proxy
 
@@ -95,7 +120,7 @@ Apply the change with `docker compose up -d --force-recreate server`; `docker co
 
 ## Features
 
-- Device registration, credential refresh, device discovery, Control, and end-to-end encrypted Relay.
+- Device registration, credential refresh, device discovery, Control, WebRTC LAN/P2P/TURN coordination, and end-to-end encrypted Relay.
 - Single-process operation with persistent data. Device credentials survive restarts; Web users sign in again. Changing the password requires devices to reauthorize.
 
 Tests: `pnpm --filter @dsh-remote/server test`. Cross-machine and long-running validation remain pending. UI sources: [web/UPSTREAM.md](web/UPSTREAM.md).

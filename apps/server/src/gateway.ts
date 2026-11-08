@@ -17,11 +17,14 @@ import {
 } from '@dsh-remote/protocol'
 import { ApiError, Store } from './store.js'
 import { Logger, type LogLevel } from './logger.js'
-import { normalizeGatewayOptions, type GatewayTimingOptions } from './config.js'
+import { normalizeGatewayOptions, normalizeMaxFramesPerSec, type GatewayTimingOptions } from './config.js'
 
 export interface GatewayOptions extends GatewayTimingOptions {
+  maxFramesPerSec?: number
   logLevel?: LogLevel
   logger?: Logger
+  /** Advertise `transport.turn` (and accept TURN credential requests). */
+  turnEnabled?: boolean
 }
 
 /**
@@ -32,8 +35,22 @@ export interface GatewayOptions extends GatewayTimingOptions {
  */
 type ConnectionState = 'awaiting_hello' | 'authenticated' | 'closing' | 'closed'
 
-type Peer = { ws: WebSocket; id: string; role: 'host' | 'client'; capabilities: string[]; version: string; lastPong: number; nonce?: string }
-type Link = { id: string; host: string; client: string; stage: 'pending' | 'accepted' | 'handshake' | 'ready'; created: number; counters: Map<string, number> }
+type Peer = { ws: WebSocket; id: string; role: 'host' | 'client'; capabilities: string[]; version: string; lastPong: number; nonce?: string; evictedTombstoneUntil?: number }
+type Link = { id: string; host: string; client: string; stage: 'pending' | 'accepted' | 'handshake' | 'ready'; created: number; counters: Map<string, number>; preferredTransports: TransportName[]; iceCandidates: number }
+type DroppedLink = { host: string; client: string; expiresAt: number; droppedFrames: number }
+
+/** Keep tombstones long enough for late in-flight frames to drain without CONNECTION_NOT_FOUND storms. */
+const DROPPED_LINK_TTL_MS = 300_000
+const MAX_DROPPED_LINKS_PER_HOST = 64
+const MAX_DROPPED_LINKS = 16_384
+
+/** Protocol v1 default: at most 256 ICE candidates per logical connection. */
+export const MAX_ICE_CANDIDATES_PER_CONNECTION = 256
+/** Mirrors docs/protocol.md: Clients use max(server, local) and default to 12 s. */
+const WEBRTC_FALLBACK_TIMEOUT_MS = 12_000
+const SUPPORTED_TRANSPORTS = ['transport.lan', 'transport.p2p', 'transport.turn', 'transport.relay'] as const
+const TRANSPORT_NAMES = ['lan', 'p2p', 'turn', 'relay'] as const
+type TransportName = (typeof TRANSPORT_NAMES)[number]
 
 function modernHost(version: string): boolean {
   const match = /^v?(\d+)\.(\d+)\.(\d+)(?:\+.*)?$/.exec(version)
@@ -91,13 +108,16 @@ function errorCode(error: unknown): string | undefined {
 export class Gateway {
   readonly peers = new Map<string, Peer>()
   private links = new Map<string, Link>()
+  private droppedLinks = new Map<string, DroppedLink>()
   private wss = new WebSocketServer({ noServer: true, maxPayload: MAX_RELAY_FRAME_BYTES, perMessageDeflate: false })
   private heartbeat: ReturnType<typeof setInterval>
   private closed = false
+  readonly turnEnabled: boolean
   readonly helloTimeoutMs: number
   readonly heartbeatIntervalMs: number
   readonly heartbeatDisconnectMs: number
   readonly forceTerminateGraceMs: number
+  readonly maxFramesPerSec: number
   readonly logger: Logger
 
   constructor(server: Server, private store: Store, origin: string, options: GatewayOptions = {}) {
@@ -109,7 +129,9 @@ export class Gateway {
     this.heartbeatIntervalMs = timing.heartbeatIntervalMs
     this.heartbeatDisconnectMs = timing.heartbeatDisconnectMs
     this.forceTerminateGraceMs = timing.forceTerminateGraceMs
+    this.maxFramesPerSec = normalizeMaxFramesPerSec(options.maxFramesPerSec)
     this.logger = options.logger ?? new Logger('gateway', options.logLevel ?? 'info')
+    this.turnEnabled = options.turnEnabled === true
 
     store.onInvalidate = id => this.disconnect(id, 'AUTH_INVALID')
     server.on('upgrade', (req, socket, head) => {
@@ -156,8 +178,82 @@ export class Gateway {
       for (const link of this.links.values()) {
         if (link.stage !== 'ready' && Date.now() - link.created > 30_000) this.drop(link, 'CONNECTION_FAILED')
       }
+      this.pruneDroppedLinks(Date.now())
     }, this.heartbeatIntervalMs)
     this.heartbeat.unref()
+  }
+
+  private pruneDroppedLinks(now: number): void {
+    for (const [id, entry] of this.droppedLinks) {
+      if (entry.expiresAt <= now) this.droppedLinks.delete(id)
+    }
+  }
+
+  private evictDroppedLink(id: string, entry: DroppedLink, now: number): void {
+    this.droppedLinks.delete(id)
+    if (entry.expiresAt <= now) return
+    for (const peerId of [entry.host, entry.client]) {
+      const p = this.peers.get(peerId)
+      if (p) p.evictedTombstoneUntil = Math.max(p.evictedTombstoneUntil ?? 0, entry.expiresAt)
+    }
+  }
+
+  private recordDroppedLink(link: Link): void {
+    const now = Date.now()
+    this.pruneDroppedLinks(now)
+    this.droppedLinks.delete(link.id)
+    let hostCount = 0
+    let oldestForHost: [string, DroppedLink] | undefined
+    for (const [id, entry] of this.droppedLinks) {
+      if (entry.host === link.host) {
+        if (oldestForHost === undefined) oldestForHost = [id, entry]
+        hostCount += 1
+      }
+    }
+    if (hostCount >= MAX_DROPPED_LINKS_PER_HOST && oldestForHost !== undefined) {
+      this.evictDroppedLink(oldestForHost[0], oldestForHost[1], now)
+    }
+    while (this.droppedLinks.size >= MAX_DROPPED_LINKS) {
+      const oldest = this.droppedLinks.entries().next().value as [string, DroppedLink] | undefined
+      if (oldest === undefined) break
+      this.evictDroppedLink(oldest[0], oldest[1], now)
+    }
+    this.droppedLinks.set(link.id, {
+      host: link.host,
+      client: link.client,
+      expiresAt: now + DROPPED_LINK_TTL_MS,
+      droppedFrames: 0,
+    })
+  }
+
+  private isDroppedLinkFrame(peer: Peer, frame: ControlFrame): boolean {
+    if (frame.type === 'ping' || frame.type === 'pong' || frame.type === 'connect.request') return false
+    const p = frame.payload as Record<string, unknown>
+    const id = p.connectionId
+    if (typeof id !== 'string' || this.links.has(id)) return false
+    const now = Date.now()
+    const dropped = this.droppedLinks.get(id)
+    if (!dropped) {
+      return peer.evictedTombstoneUntil !== undefined && now < peer.evictedTombstoneUntil
+    }
+    if (dropped.expiresAt <= now) {
+      this.droppedLinks.delete(id)
+      return false
+    }
+    if (peer.id !== dropped.host && peer.id !== dropped.client) return false
+    dropped.droppedFrames += 1
+    if (dropped.droppedFrames === 1) {
+      this.logger.debug('ws_stale_link_frames_dropped', {
+        peerId: peer.id,
+        role: peer.role,
+        connectionId: safeText(id),
+      })
+    }
+    return true
+  }
+
+  droppedLinkFrameCount(connectionId: string): number {
+    return this.droppedLinks.get(connectionId)?.droppedFrames ?? 0
   }
 
   private send(peer: Peer, frame: ControlFrame): void {
@@ -167,6 +263,7 @@ export class Gateway {
   }
   private drop(link: Link, code: string): void {
     this.links.delete(link.id)
+    this.recordDroppedLink(link)
     for (const id of [link.host, link.client]) {
       const p = this.peers.get(id)
       if (p && (p.role === 'client' || modernHost(p.version))) this.send(p, createControlFrame('error', { code, message: code, connectionId: link.id, retryable: true }))
@@ -187,6 +284,25 @@ export class Gateway {
       if (peer.ws.readyState !== WebSocket.CLOSED) peer.ws.terminate()
     }, this.forceTerminateGraceMs)
     timer.unref()
+  }
+
+  /**
+   * Authorize a REST `/api/v1/turn/credentials` request. Only the two devices
+   * of an active logical connection may obtain credentials, and only while
+   * that connection is still being established.
+   */
+  authorizeIce(deviceId: string, connectionId: string): boolean {
+    const link = this.links.get(connectionId)
+    if (link === undefined) return false
+    if (link.host !== deviceId && link.client !== deviceId) return false
+    if (link.stage !== 'accepted' && link.stage !== 'handshake') return false
+    return this.peers.has(link.host) && this.peers.has(link.client)
+  }
+  private supportedCapabilities(): string[] {
+    return SUPPORTED_TRANSPORTS.filter(capability => capability !== 'transport.turn' || this.turnEnabled)
+  }
+  private negotiatedCapabilities(offered: readonly string[]): string[] {
+    return this.supportedCapabilities().filter(capability => offered.includes(capability))
   }
 
   private accept(ws: WebSocket): void {
@@ -246,7 +362,7 @@ export class Gateway {
     }, this.helloTimeoutMs)
     deadline.unref()
 
-    let windowStart = Date.now(), frames = 0, bytes = 0
+    let windowStart = Date.now(), frames = 0, bytes = 0, droppedFrames = 0, droppedBytes = 0
     ws.on('error', (error) => {
       // Error messages can embed payload fragments: log the class and errno only.
       this.logger.warn('ws_socket_error', {
@@ -259,8 +375,8 @@ export class Gateway {
       state = 'closed'
       clearDeadline()
       clearGrace()
-      this.logger.debug('ws_connection_closed', {
-        peerId: peer?.id,
+      this.logger.info('ws_connection_closed', {
+        ...(peer ? { peerId: peer.id, role: peer.role } : {}),
         code,
         // The close reason is arbitrary client text: report only its presence.
         hasReason: Buffer.isBuffer(reason) ? reason.length > 0 : false,
@@ -276,8 +392,23 @@ export class Gateway {
       try {
         if (binary) throw new ApiError('INVALID_MESSAGE')
         const text = raw.toString()
-        if (Date.now() - windowStart >= 1000) { windowStart = Date.now(); frames = 0; bytes = 0 }
-        if (++frames > 512 || (bytes += Buffer.byteLength(text)) > 16 * MAX_RELAY_FRAME_BYTES) throw new ApiError('RATE_LIMITED')
+        const frameBytes = Buffer.byteLength(text)
+        if (Date.now() - windowStart >= 1000) {
+          windowStart = Date.now()
+          frames = 0
+          bytes = 0
+          droppedFrames = 0
+          droppedBytes = 0
+        }
+        const maxDroppedFrames = Math.max(this.maxFramesPerSec * 2, 1024)
+        const maxDroppedBytes = 8 * MAX_RELAY_FRAME_BYTES
+        if (frames + droppedFrames + 1 > this.maxFramesPerSec + maxDroppedFrames
+          || bytes + droppedBytes + frameBytes > 16 * MAX_RELAY_FRAME_BYTES + maxDroppedBytes) {
+          throw new ApiError('RATE_LIMITED')
+        }
+        if (state === 'awaiting_hello' && (++frames > this.maxFramesPerSec || (bytes += frameBytes) > 16 * MAX_RELAY_FRAME_BYTES)) {
+          throw new ApiError('RATE_LIMITED')
+        }
         const envelope = JSON.parse(text) as { v?: unknown }
         if (envelope && envelope.v !== 1) throw new ApiError('UNSUPPORTED_VERSION')
         frame = decodeControlFrame(text)
@@ -293,7 +424,10 @@ export class Gateway {
           state = 'authenticated'
           clearDeadline()
           this.disconnect(device.deviceId, 'CONNECTION_REPLACED')
-          peer = { ws, id: device.deviceId, role: device.role, capabilities: p.capabilities, version: p.clientVersion ?? device.clientVersion, lastPong: Date.now() }
+          // Keep the negotiated set (what hello.ack advertises), so a link can
+          // never coordinate a transport this Server did not offer — e.g. TURN
+          // while no TURN deployment is configured.
+          peer = { ws, id: device.deviceId, role: device.role, capabilities: this.negotiatedCapabilities(p.capabilities), version: p.clientVersion ?? device.clientVersion, lastPong: Date.now() }
           this.peers.set(peer.id, peer)
           this.store.touch(peer.id, p.clientVersion, p.harnessVersion)
           this.logger.info('ws_hello_authenticated', {
@@ -309,15 +443,24 @@ export class Gateway {
             heartbeatIntervalMs: this.heartbeatIntervalMs,
             maxControlFrameBytes: MAX_CONTROL_FRAME_BYTES,
             maxRelayFrameBytes: MAX_RELAY_FRAME_BYTES,
-            capabilities: p.capabilities.includes('transport.relay') ? ['transport.relay'] : [],
-            webrtcEnabled: false,
-            webrtcFallbackTimeoutMs: 1,
+            capabilities: this.negotiatedCapabilities(p.capabilities),
+            webrtcEnabled: true,
+            webrtcFallbackTimeoutMs: WEBRTC_FALLBACK_TIMEOUT_MS,
           }))
           return
         }
         if (frame.type === 'hello') throw new ApiError('INVALID_MESSAGE')
         if (!peer || this.peers.get(peer.id) !== peer) throw new ApiError('AUTH_INVALID')
         this.store.get(peer.id)
+        if (this.isDroppedLinkFrame(peer, frame)) {
+          if (++droppedFrames > maxDroppedFrames || (droppedBytes += frameBytes) > maxDroppedBytes) {
+            throw new ApiError('RATE_LIMITED')
+          }
+          return
+        }
+        if (++frames > this.maxFramesPerSec || (bytes += frameBytes) > 16 * MAX_RELAY_FRAME_BYTES) {
+          throw new ApiError('RATE_LIMITED')
+        }
         this.handle(peer, frame)
       } catch (error) {
         const code = error instanceof ApiError ? error.code : 'INVALID_MESSAGE'
@@ -358,15 +501,47 @@ export class Gateway {
     if (frame.type === 'connect.request') {
       const request = frame.payload as ConnectRequestPayload
       if (peer.role !== 'client') throw new ApiError('MEMBERSHIP_REQUIRED')
+      const candidateHost = this.peers.get(request.hostDeviceId)
+      if (candidateHost && Date.now() - candidateHost.lastPong > this.heartbeatDisconnectMs) {
+        this.logger.warn('ws_heartbeat_timeout', {
+          peerId: candidateHost.id,
+          role: candidateHost.role,
+          lastPong: candidateHost.lastPong,
+          elapsedMs: Date.now() - candidateHost.lastPong,
+          thresholdMs: this.heartbeatDisconnectMs,
+        })
+        this.disconnect(candidateHost.id, 'CONNECTION_FAILED')
+      }
       const host = this.peers.get(request.hostDeviceId)
       if (!host || host.role !== 'host') { this.send(peer, createControlFrame('error', { code: 'HOST_OFFLINE', message: 'Host is offline.', retryable: true })); return }
       this.store.get(host.id)
       if (!request.preferredTransports.includes('relay') || !peer.capabilities.includes('transport.relay') || !host.capabilities.includes('transport.relay')) throw new ApiError('CAPABILITY_NOT_SUPPORTED')
+      // The link coordinates only transports both peers actually advertised;
+      // the Host receives the same intersection so it never sees a transport
+      // it could not have negotiated.
+      const preferredTransports = [...new Set(request.preferredTransports)].filter(transport =>
+        peer.capabilities.includes(`transport.${transport}`) && host.capabilities.includes(`transport.${transport}`))
+      if (preferredTransports.length === 0) throw new ApiError('CAPABILITY_NOT_SUPPORTED')
       for (const old of this.links.values()) if (old.client === peer.id || (old.host === host.id && !modernHost(host.version))) this.drop(old, 'CONNECTION_REPLACED')
       if (this.links.size >= 256) throw new ApiError('RATE_LIMITED')
-      const link: Link = { id: randomUUID(), host: host.id, client: peer.id, stage: 'pending', created: Date.now(), counters: new Map() }
+      const link: Link = {
+        id: randomUUID(),
+        host: host.id,
+        client: peer.id,
+        stage: 'pending',
+        created: Date.now(),
+        counters: new Map(),
+        preferredTransports,
+        iceCandidates: 0,
+      }
       this.links.set(link.id, link)
-      this.send(host, createControlFrame('connect.incoming', { connectionId: link.id, clientDeviceId: peer.id, clientIdentityKey: this.store.get(peer.id).descriptor.identityKey, authorization: 'account', preferredTransports: ['relay'] }))
+      this.send(host, createControlFrame('connect.incoming', {
+        connectionId: link.id,
+        clientDeviceId: peer.id,
+        clientIdentityKey: this.store.get(peer.id).descriptor.identityKey,
+        authorization: 'account',
+        preferredTransports: link.preferredTransports,
+      }))
       return
     }
     const id = p.connectionId
@@ -378,18 +553,23 @@ export class Gateway {
     if (!other) throw new ApiError('CONNECTION_FAILED')
     if (frame.type === 'connect.accepted' || frame.type === 'connect.rejected') {
       if (peer.id !== link.host || link.stage !== 'pending') throw new ApiError('INVALID_MESSAGE')
-      if (frame.type === 'connect.rejected') this.links.delete(link.id)
+      if (frame.type === 'connect.rejected') {
+        this.links.delete(link.id)
+        this.recordDroppedLink(link)
+      }
       else link.stage = 'accepted'
       this.send(other, frame)
       return
     }
     if (p.targetDeviceId !== otherId || link.stage === 'pending') throw new ApiError('CONNECTION_NOT_FOUND')
-    if (frame.type === 'transport.selected') {
-      if (peer.id !== link.client || (frame.payload as TransportSelectedPayload).transport !== 'relay') throw new ApiError('CAPABILITY_NOT_SUPPORTED')
-      if (modernHost(other.version)) this.send(other, frame)
+    if (frame.type.startsWith('signal.')) {
+      this.forwardSignal(link, peer, other, frame)
       return
     }
-    if (frame.type.startsWith('signal.')) return // Relay-only negotiation: no signaling forwarding.
+    if (frame.type === 'transport.selected') {
+      this.forwardTransportSelected(link, peer, other, frame.payload as TransportSelectedPayload)
+      return
+    }
     if (frame.type === 'secure.handshake') {
       const step = (frame.payload as SecureHandshakePayload).step
       if (step === 1 && peer.id === link.client && link.stage === 'accepted') link.stage = 'handshake'
@@ -401,6 +581,55 @@ export class Gateway {
       link.counters.set(peer.id, counter)
     } else throw new ApiError('INVALID_MESSAGE')
     this.send(other, frame)
+  }
+  /**
+   * Forward WebRTC signaling only while the logical connection is being
+   * established, and only for a transport this link actually negotiated. A
+   * relay-only link has no data plane to coordinate — the Host treats
+   * unsolicited signaling as a protocol violation that closes its whole
+   * Control connection and every tunnel on it, so such frames are dropped for
+   * the Client to time out and fall back to Relay.
+   */
+  private forwardSignal(link: Link, peer: Peer, other: Peer, frame: ControlFrame): void {
+    if (link.stage === 'ready') return
+    if (!link.preferredTransports.some(transport => transport !== 'relay')) return
+    if (frame.type === 'signal.offer') {
+      if (peer.id !== link.client) throw new ApiError('INVALID_MESSAGE')
+    } else if (frame.type === 'signal.answer') {
+      if (peer.id !== link.host) throw new ApiError('INVALID_MESSAGE')
+    } else if (frame.type === 'signal.ice') {
+      if (++link.iceCandidates > MAX_ICE_CANDIDATES_PER_CONNECTION) throw new ApiError('INVALID_MESSAGE')
+    } else {
+      throw new ApiError('INVALID_MESSAGE')
+    }
+    this.send(other, frame)
+  }
+  /**
+   * Forward the initiator's transport choice, gated on the transports the
+   * link negotiated. `lan` is downgraded to `p2p` only when the link did not
+   * negotiate `transport.lan` (old RC2 peers), as required by
+   * docs/protocol.md. Relay keeps the legacy compatibility gate.
+   */
+  private forwardTransportSelected(link: Link, peer: Peer, other: Peer, payload: TransportSelectedPayload): void {
+    // The protocol only lets the initiator (Client) select the transport. A
+    // responder (Host) may also announce its own selection after its RTC data
+    // channel opens; clients ignore it, so ignoring here is compatibility, not
+    // a protocol violation. Throwing would drop the whole link and prevent the
+    // Noise handshake from completing.
+    if (peer.id !== link.client) return
+    if (link.stage !== 'accepted' && link.stage !== 'handshake') throw new ApiError('INVALID_MESSAGE')
+    const transport: TransportName = payload.transport
+    if (!TRANSPORT_NAMES.includes(transport)) throw new ApiError('INVALID_MESSAGE')
+    const selected = transport === 'lan'
+      && !link.preferredTransports.includes('lan')
+      && link.preferredTransports.includes('p2p')
+      ? 'p2p'
+      : transport
+    if (!link.preferredTransports.includes(selected)) throw new ApiError('CAPABILITY_NOT_SUPPORTED')
+    if (selected === 'relay' && !modernHost(other.version)) return
+    this.send(other, selected === transport
+      ? createControlFrame('transport.selected', { ...payload })
+      : createControlFrame('transport.selected', { ...payload, transport: selected }))
   }
   close(): void {
     if (this.closed) return

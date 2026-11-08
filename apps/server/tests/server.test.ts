@@ -3,22 +3,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHmac } from 'node:crypto'
 import { once } from 'node:events'
 import { createConnection } from 'node:net'
+import { request as httpRequest } from 'node:http'
 import { WebSocket } from 'ws'
 import { MAX_CONTROL_FRAME_BYTES, createControlFrame } from '@dsh-remote/protocol'
 import { NoiseIkSession, createNoisePrologue, generateKeyPair, toBase64Url, fromBase64Url } from '../../../packages/crypto/src/index.js'
 import { RelayTransport } from '../../../packages/webrtc/src/index.js'
 import { ClientSecureTransport } from '../../../packages/plugin/src/client-secure-transport.js'
+import { ClientServerApi } from '../../../packages/plugin/src/server-api.js'
+import { IdentityStore } from '../../../packages/plugin/src/identity-store.js'
+import { ServerCredentialStore } from '../../../packages/plugin/src/server-credentials.js'
 import {
   createRemoteServer,
   normalizeGatewayOptions,
+  normalizeMaxFramesPerSec,
   normalizeIp,
   normalizeTrustedProxyIps,
   parseHelloTimeout,
   parseHeartbeatInterval,
   parseHeartbeatDisconnect,
+  parseMaxFramesPerSec,
   type Config,
 } from '../src/server.js'
 import {
@@ -27,6 +33,8 @@ import {
   parseLogLevel,
   type LogEntry,
 } from '../src/logger.js'
+import { MAX_ICE_CANDIDATES_PER_CONNECTION } from '../src/gateway.js'
+import { parseIceConfig } from '../src/ice.js'
 
 const account = 'owner@example.com', password = 'local-test-password'
 let app: ReturnType<typeof createRemoteServer>, dir: string, base: string, accountToken: string
@@ -90,22 +98,28 @@ class Wire {
     throw new Error(`Missing frame ${type}`)
   }
 }
+const fullCapabilities = ['transport.lan', 'transport.p2p', 'transport.turn', 'transport.relay']
+const fullPreferredTransports = ['lan', 'p2p', 'turn', 'relay']
 async function socket(d: Awaited<ReturnType<typeof device>>, overrides = {}) {
   const ws = new WebSocket(base.replace('http:', 'ws:') + '/ws/v1/connect'); sockets.push(ws)
   const wire = new Wire(ws); await once(ws, 'open')
-  wire.send('hello', { role: d.role, deviceId: d.deviceId, accessToken: d.accessToken, protocols: [1], capabilities: ['transport.relay', 'transport.p2p'], clientVersion: d.clientVersion, ...overrides })
+  wire.send('hello', { role: d.role, deviceId: d.deviceId, accessToken: d.accessToken, protocols: [1], capabilities: fullCapabilities, clientVersion: d.clientVersion, ...overrides })
   return wire
 }
-async function connection() {
-  const h = await device('host'), c = await device(), host = await socket(h), client = await socket(c)
-  expect(await host.next('hello.ack')).toMatchObject({ capabilities: ['transport.relay'], webrtcEnabled: false })
+async function connection(options: { hostCapabilities?: string[]; clientCapabilities?: string[]; preferredTransports?: string[] } = {}) {
+  const h = await device('host'), c = await device()
+  const host = await socket(h, options.hostCapabilities === undefined ? {} : { capabilities: options.hostCapabilities })
+  const client = await socket(c, options.clientCapabilities === undefined ? {} : { capabilities: options.clientCapabilities })
+  const ack = await host.next('hello.ack')
+  expect(ack).toMatchObject({ webrtcEnabled: true })
+  expect(ack.capabilities).toEqual(expect.arrayContaining(['transport.relay']))
   await client.next('hello.ack')
-  client.send('connect.request', { hostDeviceId: h.deviceId, preferredTransports: ['relay'] })
+  client.send('connect.request', { hostDeviceId: h.deviceId, preferredTransports: options.preferredTransports ?? ['relay'] })
   const incoming = await host.next('connect.incoming')
   expect(incoming.clientIdentityKey).toBe(c.identityKey)
   host.send('connect.accepted', { connectionId: incoming.connectionId })
   const { connectionId } = await client.next('connect.accepted')
-  return { h, c, host, client, connectionId }
+  return { h, c, host, client, connectionId, incoming }
 }
 async function handshake(ctx: Awaited<ReturnType<typeof connection>>) {
   const { h, c, host, client, connectionId } = ctx
@@ -191,17 +205,74 @@ describe('account and device authorization', () => {
     expect((await request('/devices/register-owned-role', 'POST', { v: 1, device: descriptor }, h.accessToken)).status).toBe(409)
     expect((await request('/devices/register-owned-role', 'POST', { v: 1, device: descriptor }, c.accessToken)).status).toBe(200)
   })
-  it('persists credentials as digests, rotates refresh tokens and revokes a reused family', async () => {
+  it('recovers a lost refresh response across restart without invalidating the successor', async () => {
     const d = await device()
     const saved = readFileSync(join(dir, 'state.json'), 'utf8')
     expect(saved).not.toContain(d.refreshToken); expect(saved).not.toContain(d.accessToken); expect(saved).not.toContain(password)
     await app.close(); await start()
     expect((await request('/devices', 'GET', undefined, d.accessToken)).status).toBe(200)
+    // Discard the successful response body, as when the link drops after commit.
+    await new Promise<void>((resolve, reject) => {
+      const req = httpRequest(base + '/api/v1/auth/refresh', { method: 'POST', headers: { 'Content-Type': 'application/json' } }, res => {
+        const status = res.statusCode
+        res.destroy()
+        if (status === 200) resolve()
+        else reject(new Error('Expected successful rotation before response loss'))
+      })
+      req.on('error', reject)
+      req.end(JSON.stringify({ deviceId: d.deviceId, refreshToken: d.refreshToken }))
+    })
+    await app.close(); await start()
     const rotated = await request('/auth/refresh', 'POST', { deviceId: d.deviceId, refreshToken: d.refreshToken })
     expect(rotated.status).toBe(200)
     expect(rotated.data.refreshTokenExpiresAt).toBe(d.refreshTokenExpiresAt)
+    const retries = await Promise.all(Array.from({ length: 3 }, () => request('/auth/refresh', 'POST', { deviceId: d.deviceId, refreshToken: d.refreshToken })))
+    for (const retry of retries) { expect(retry.status).toBe(200); expect(retry.data).toEqual(rotated.data) }
+    expect((await request('/devices', 'GET', undefined, rotated.data.accessToken)).status).toBe(200)
+    const next = await request('/auth/refresh', 'POST', { deviceId: d.deviceId, refreshToken: rotated.data.refreshToken })
+    expect(next.status).toBe(200)
     expect((await request('/auth/refresh', 'POST', { deviceId: d.deviceId, refreshToken: d.refreshToken })).status).toBe(401)
-    expect((await request('/devices', 'GET', undefined, rotated.data.accessToken)).status).toBe(401)
+    expect((await request('/devices', 'GET', undefined, next.data.accessToken)).status).toBe(200)
+    const persisted = readFileSync(join(dir, 'state.json'), 'utf8')
+    for (const value of [d.accessToken, d.refreshToken, rotated.data.accessToken, rotated.data.refreshToken, next.data.refreshToken]) {
+      expect(persisted).not.toContain(value)
+    }
+  })
+  it('lets the Plugin recover a dropped refresh response without signing in again, even after access expiry', async () => {
+    await runScenarios([0, 2 * 60 * 60_000].map(delay => ({
+      name: delay === 0 ? 'immediate retry' : 'two hours offline', run: async () => {
+        const identity = await new IdentityStore({ directory: join(dir, `identity-${delay}`) }).loadOrCreate('test')
+        const credentials = new ServerCredentialStore(join(dir, `client-${delay}`))
+        let loseResponse = true, logins = 0, registrations = 0
+        const api = new ClientServerApi(base, credentials, async (url, init) => {
+          if (url.endsWith('/auth/login')) logins++
+          if (url.endsWith('/devices/register')) registrations++
+          const response = await fetch(url, init)
+          if (loseResponse && url.endsWith('/auth/refresh')) {
+            loseResponse = false
+            expect(response.status).toBe(200)
+            await response.arrayBuffer()
+            throw new TypeError('Simulated response loss after Server commit')
+          }
+          return response
+        })
+        await api.authorizeWithAccount(identity, account, password)
+        const before = await credentials.load(base, identity.deviceId)
+        await expect(api.refreshCredentials()).rejects.toMatchObject({ code: 'CONNECTION_FAILED', phase: 'credential_refresh' })
+        expect(await credentials.load(base, identity.deviceId)).toEqual(before)
+        const now = Date.now() + delay
+        const clock = vi.spyOn(Date, 'now').mockReturnValue(now)
+        try {
+          if (delay === 0) await api.refreshCredentials()
+          await expect(api.listDevices()).resolves.toEqual([])
+          const recovered = await credentials.load(base, identity.deviceId)
+          expect(recovered?.refreshToken).not.toBe(before?.refreshToken)
+          expect(recovered?.accessTokenExpiresAt).toBeGreaterThan(now)
+          expect(recovered?.refreshTokenExpiresAt).toBe(before?.refreshTokenExpiresAt)
+          expect(logins).toBe(1); expect(registrations).toBe(1)
+        } finally { clock.mockRestore() }
+      },
+    })))
   })
   it('invalidates credentials when the configured password changes', async () => {
     const d = await device(); await app.close(); await start('a-different-password')
@@ -371,6 +442,246 @@ describe('control authorization and encrypted relay', () => {
   })
 })
 
+
+describe('webrtc signaling and TURN credentials', () => {
+  const candidate = (index: number) => ({
+    candidate: `candidate:${index} 1 udp 2122260223 192.0.2.1 ${50000 + index} typ host`,
+    sdpMid: '0',
+    sdpMLineIndex: 0,
+  })
+
+  it('advertises the negotiated WebRTC transports and only enables TURN when configured', async () => {
+    const partial = await socket(await device(), { capabilities: ['transport.p2p', 'transport.relay'] })
+    expect(await partial.next('hello.ack')).toMatchObject({
+      capabilities: ['transport.p2p', 'transport.relay'],
+      webrtcEnabled: true,
+      webrtcFallbackTimeoutMs: 12_000,
+    })
+    const withoutTurn = await socket(await device(), { capabilities: fullCapabilities })
+    expect(await withoutTurn.next('hello.ack')).toMatchObject({
+      capabilities: ['transport.lan', 'transport.p2p', 'transport.relay'],
+    })
+    await app.close()
+    await start(password, [], {
+      ice: {
+        stunUrls: ['stun:stun.example.test:3478'],
+        turnUrls: ['turn:turn.example.test:3478?transport=udp'],
+        turnSecret: 'test-turn-secret',
+        turnTtlSeconds: 120,
+      },
+    })
+    accountToken = (await request('/auth/login', 'POST', { email: account, password })).data.token
+    const withTurn = await socket(await device(), { capabilities: fullCapabilities })
+    expect(await withTurn.next('hello.ack')).toMatchObject({ capabilities: fullCapabilities })
+  })
+
+  it('forwards ordered WebRTC signaling and transport selection', async () => {
+    const ctx = await connection({ hostCapabilities: fullCapabilities, clientCapabilities: fullCapabilities, preferredTransports: fullPreferredTransports })
+    ctx.client.send('signal.offer', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, sdp: 'v=0 offer' })
+    expect(await ctx.host.next('signal.offer')).toMatchObject({ connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId })
+    ctx.host.send('signal.answer', { connectionId: ctx.connectionId, targetDeviceId: ctx.c.deviceId, sdp: 'v=0 answer' })
+    expect(await ctx.client.next('signal.answer')).toMatchObject({ sdp: 'v=0 answer' })
+    for (let index = 0; index < 3; index++) {
+      ctx.client.send('signal.ice', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, candidate: candidate(index) })
+    }
+    for (let index = 0; index < 3; index++) {
+      expect((await ctx.host.next('signal.ice')).candidate).toEqual(candidate(index))
+    }
+    ctx.client.send('transport.selected', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, transport: 'lan' })
+    expect(await ctx.host.next('transport.selected')).toMatchObject({ transport: 'lan' })
+  })
+
+  it('downgrades LAN to P2P for a host that did not negotiate transport.lan', async () => {
+    const ctx = await connection({ hostCapabilities: ['transport.p2p', 'transport.relay'], clientCapabilities: fullCapabilities, preferredTransports: fullPreferredTransports })
+    ctx.client.send('transport.selected', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, transport: 'lan' })
+    expect(await ctx.host.next('transport.selected')).toMatchObject({ transport: 'p2p' })
+  })
+
+  it('tolerates a responder transport selection without dropping the link', async () => {
+    const ctx = await connection({ hostCapabilities: fullCapabilities, clientCapabilities: fullCapabilities, preferredTransports: fullPreferredTransports })
+    ctx.client.send('transport.selected', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, transport: 'lan' })
+    expect(await ctx.host.next('transport.selected')).toMatchObject({ transport: 'lan' })
+    // The Host (responder) also announces its own selection; it must be
+    // ignored rather than treated as an invalid frame that drops the link.
+    ctx.host.send('transport.selected', { connectionId: ctx.connectionId, targetDeviceId: ctx.c.deviceId, transport: 'p2p' })
+    ctx.client.send('ping', { nonce: 'responder-selection' })
+    expect(await ctx.client.next('pong')).toEqual({ nonce: 'responder-selection' })
+    expect(ctx.client.messages.filter(message => message.type === 'error')).toHaveLength(0)
+  })
+
+  it('does not forward signaling to a host that cannot use WebRTC', async () => {
+    const ctx = await connection({ hostCapabilities: ['transport.relay'], clientCapabilities: fullCapabilities, preferredTransports: fullPreferredTransports })
+    ctx.client.send('signal.offer', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, sdp: 'v=0 offer' })
+    ctx.client.send('signal.ice', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, candidate: candidate(0) })
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(ctx.host.messages.filter(message => message.type === 'signal.offer' || message.type === 'signal.ice')).toHaveLength(0)
+    await handshake(ctx)
+    ctx.client.send('relay', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, counter: 0, ciphertext: 'AQIDBA' })
+    expect(await ctx.host.next('relay')).toMatchObject({ connectionId: ctx.connectionId })
+  })
+
+  it('drops signaling on a relay-only link without closing the connection', async () => {
+    const ctx = await connection({ hostCapabilities: fullCapabilities, clientCapabilities: fullCapabilities, preferredTransports: ['relay'] })
+    // Both peers support WebRTC, but this link only negotiated Relay (e.g. a
+    // force-relay Client). Signaling must be dropped instead of forwarded: the
+    // Host treats unsolicited signaling as a protocol violation that would
+    // close its whole Control connection.
+    ctx.client.send('signal.offer', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, sdp: 'v=0 offer' })
+    ctx.client.send('signal.ice', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, candidate: candidate(0) })
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(ctx.host.messages.filter(message => message.type === 'signal.offer' || message.type === 'signal.ice')).toHaveLength(0)
+    expect(ctx.client.messages.filter(message => message.type === 'error')).toHaveLength(0)
+    await handshake(ctx)
+    ctx.client.send('relay', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, counter: 0, ciphertext: 'AQIDBA' })
+    expect(await ctx.host.next('relay')).toMatchObject({ connectionId: ctx.connectionId })
+  })
+
+  it('narrows connect.incoming to the transports both peers support', async () => {
+    const ctx = await connection({ hostCapabilities: ['transport.lan', 'transport.p2p', 'transport.relay'], clientCapabilities: fullCapabilities, preferredTransports: fullPreferredTransports })
+    // The TURN transport is also absent because this test Server has no TURN
+    // deployment configured, so the intersection cannot include it.
+    expect(ctx.incoming.preferredTransports).toEqual(['lan', 'p2p', 'relay'])
+    ctx.client.send('transport.selected', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, transport: 'turn' })
+    expect((await ctx.client.next('error')).code).toBe('CAPABILITY_NOT_SUPPORTED')
+  })
+
+  it('enforces the per-connection ICE candidate limit', async () => {
+    const ctx = await connection({ hostCapabilities: fullCapabilities, clientCapabilities: fullCapabilities, preferredTransports: fullPreferredTransports })
+    for (let index = 0; index < MAX_ICE_CANDIDATES_PER_CONNECTION; index++) {
+      ctx.client.send('signal.ice', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, candidate: candidate(index) })
+    }
+    ctx.client.send('signal.ice', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, candidate: candidate(MAX_ICE_CANDIDATES_PER_CONNECTION) })
+    expect((await ctx.client.next('error')).code).toBe('INVALID_MESSAGE')
+  })
+
+  it('issues short-lived STUN/TURN credentials only to connection participants', async () => {
+    await app.close()
+    await start(password, [], {
+      ice: {
+        stunUrls: ['stun:stun.example.test:3478'],
+        turnUrls: ['turn:turn.example.test:3478?transport=udp'],
+        turnSecret: 'test-turn-secret',
+        turnTtlSeconds: 120,
+      },
+    })
+    accountToken = (await request('/auth/login', 'POST', { email: account, password })).data.token
+    const ctx = await connection({ hostCapabilities: fullCapabilities, clientCapabilities: fullCapabilities, preferredTransports: fullPreferredTransports })
+    // Negotiate TURN before selecting it; the diagnostic must survive forwarding.
+    ctx.client.send('transport.selected', { connectionId: ctx.connectionId, targetDeviceId: ctx.h.deviceId, transport: 'turn', turnNode: 'turn.example.test:3478' })
+    expect(await ctx.host.next('transport.selected')).toMatchObject({ transport: 'turn', turnNode: 'turn.example.test:3478' })
+    const before = Date.now()
+    const result = await request(`/turn/credentials?connection_id=${ctx.connectionId}`, 'GET', undefined, ctx.c.accessToken)
+    expect(result.status).toBe(200)
+    const [stun, turn] = result.data.iceServers as Array<{ urls: string; username?: string; credential?: string }>
+    expect(stun).toEqual({ urls: 'stun:stun.example.test:3478' })
+    const expiresAt = Number(String(turn!.username).split(':')[0])
+    expect(expiresAt).toBeGreaterThanOrEqual(Math.floor(before / 1000) + 120)
+    expect(expiresAt).toBeLessThanOrEqual(Math.ceil(Date.now() / 1000) + 120)
+    expect(turn!.credential).toBe(createHmac('sha1', 'test-turn-secret').update(turn!.username!).digest('base64'))
+    expect((await request(`/turn/credentials?connection_id=${ctx.connectionId}`, 'GET', undefined, ctx.h.accessToken)).status).toBe(200)
+
+    const stranger = await device()
+    expect((await request(`/turn/credentials?connection_id=${ctx.connectionId}`, 'GET', undefined, stranger.accessToken)).status).toBe(404)
+    expect((await request(`/turn/credentials?connection_id=${randomUUID()}`, 'GET', undefined, ctx.c.accessToken)).status).toBe(404)
+    expect((await request('/turn/credentials', 'GET', undefined, ctx.c.accessToken)).status).toBe(400)
+
+    await handshake(ctx)
+    expect((await request(`/turn/credentials?connection_id=${ctx.connectionId}`, 'GET', undefined, ctx.c.accessToken)).status).toBe(404)
+  })
+
+  it('issues configured static TURN credentials', async () => {
+    await app.close()
+    await start(password, [], {
+      ice: {
+        stunUrls: [],
+        turnUrls: ['turn:turn.example.test:3478'],
+        turnSecret: undefined,
+        turnUsername: 'remote',
+        turnPassword: 'static-turn-password',
+        turnTtlSeconds: 120,
+      },
+    })
+    accountToken = (await request('/auth/login', 'POST', { email: account, password })).data.token
+    const ctx = await connection({ hostCapabilities: fullCapabilities, clientCapabilities: fullCapabilities })
+    const result = await request(`/turn/credentials?connection_id=${ctx.connectionId}`, 'GET', undefined, ctx.c.accessToken)
+    expect(result.status).toBe(200)
+    expect(result.data.iceServers).toEqual([{ urls: 'turn:turn.example.test:3478', username: 'remote', credential: 'static-turn-password' }])
+  })
+
+  it('rejects partial TURN credential configuration at startup', async () => {
+    await runScenarios([
+      {
+        name: 'urls without any credential source',
+        run: () => {
+          expect(() => parseIceConfig({ DSH_SERVER_TURN_URLS: 'turn:turn.example.test:3478' })).toThrow(/DSH_SERVER_TURN_URLS requires/)
+        },
+      },
+      {
+        name: 'secret together with static credentials',
+        run: () => {
+          expect(() => parseIceConfig({
+            DSH_SERVER_TURN_URLS: 'turn:turn.example.test:3478',
+            DSH_SERVER_TURN_SECRET: 'secret',
+            DSH_SERVER_TURN_USERNAME: 'remote',
+            DSH_SERVER_TURN_PASSWORD: 'password',
+          })).toThrow(/not both/)
+        },
+      },
+      {
+        name: 'static username without password',
+        run: () => {
+          expect(() => parseIceConfig({
+            DSH_SERVER_TURN_URLS: 'turn:turn.example.test:3478',
+            DSH_SERVER_TURN_USERNAME: 'remote',
+          })).toThrow(/together/)
+        },
+      },
+      {
+        name: 'static credentials without urls',
+        run: () => {
+          expect(() => parseIceConfig({
+            DSH_SERVER_TURN_USERNAME: 'remote',
+            DSH_SERVER_TURN_PASSWORD: 'password',
+          })).toThrow(/DSH_SERVER_TURN_URLS is required/)
+        },
+      },
+      {
+        name: 'secret without urls',
+        run: () => {
+          expect(() => parseIceConfig({ DSH_SERVER_TURN_SECRET: 'secret' })).toThrow(/DSH_SERVER_TURN_URLS is required/)
+        },
+      },
+      {
+        name: 'accepts a complete static pair',
+        run: () => {
+          expect(parseIceConfig({
+            DSH_SERVER_TURN_URLS: 'turn:turn.example.test:3478',
+            DSH_SERVER_TURN_USERNAME: 'remote',
+            DSH_SERVER_TURN_PASSWORD: 'password',
+          })).toMatchObject({ turnUsername: 'remote', turnPassword: 'password', turnSecret: undefined })
+        },
+      },
+    ])
+  })
+
+  it('does not issue TURN credentials before the host accepts the connection', async () => {
+    await app.close()
+    await start(password, [], {
+      ice: {
+        stunUrls: [],
+        turnUrls: ['turn:turn.example.test:3478'],
+        turnSecret: 'test-turn-secret',
+        turnTtlSeconds: 120,
+      },
+    })
+    accountToken = (await request('/auth/login', 'POST', { email: account, password })).data.token
+    const h = await device('host'), c = await device(), host = await socket(h), client = await socket(c)
+    await host.next('hello.ack'); await client.next('hello.ack')
+    client.send('connect.request', { hostDeviceId: h.deviceId, preferredTransports: ['relay'] })
+    const incoming = await host.next('connect.incoming')
+    expect((await request(`/turn/credentials?connection_id=${incoming.connectionId}`, 'GET', undefined, c.accessToken)).status).toBe(404)
+  })
+})
 
 describe('reverse-proxy client IP rate limiting', () => {
   const trusted = ['127.0.0.1', '::ffff:127.0.0.1']
@@ -614,6 +925,13 @@ describe('structured logger and sensitive data redaction', () => {
     expect(parseLogLevel('WARN')).toBe('warn')
     expect(parseLogLevel('silent')).toBe('silent')
     expect(parseLogLevel('invalid_level')).toBe('info')
+
+    // Max frames per second
+    expect(parseMaxFramesPerSec(undefined)).toBe(512)
+    expect(parseMaxFramesPerSec('4096')).toBe(4096)
+    expect(parseMaxFramesPerSec('32')).toBe(512)
+    expect(parseMaxFramesPerSec('100000')).toBe(512)
+    expect(normalizeMaxFramesPerSec(Number.NaN)).toBe(512)
   })
 })
 
@@ -886,5 +1204,151 @@ describe('gateway diagnostics redaction', () => {
     expect(log).toContain('ws_connection_closed')
     expect(log).toContain('"hasReason":true')
     expect(log).not.toContain('CANARY-REASON')
+  })
+})
+
+describe('stale link frame dropping and configurable rate limit', () => {
+  it('silently drops late frames for a closed link even after the active frame quota is full, while bounding sustained stale byte floods', async () => {
+    await app.close()
+    await start(password, [], { maxFramesPerSec: 64 })
+    accountToken = (await request('/auth/login', 'POST', { email: account, password })).data.token
+
+    const ctx = await connection()
+    await handshake(ctx)
+    const closedClient = once(ctx.client.ws, 'close')
+    ctx.client.ws.close(1000, 'client closed')
+    await closedClient
+    expect(await ctx.host.next('error')).toMatchObject({
+      code: 'CONNECTION_FAILED',
+      connectionId: ctx.connectionId,
+      retryable: true,
+    })
+
+    // Churn 1,100 dropped links on an unrelated Host: per-Host tombstone isolation must prevent
+    // unrelated churn from evicting ctx.connectionId's tombstone.
+    const churnHost = await device('host')
+    const churnClient = await device('client')
+    const churnHostWire = await socket(churnHost)
+    const churnClientWire = await socket(churnClient)
+    await churnHostWire.next('hello.ack')
+    await churnClientWire.next('hello.ack')
+    const gatewayInternals = app.gateway as unknown as {
+      recordDroppedLink(link: { id: string; host: string; client: string }): void
+    }
+    for (let i = 0; i < 1100; i++) {
+      gatewayInternals.recordDroppedLink({
+        id: `churn-link-${i}`,
+        host: churnHost.deviceId,
+        client: churnClient.deviceId,
+      })
+    }
+
+    // Fill the normal 64-frame quota first with active traffic in the current window.
+    for (let i = 0; i < 60; i++) {
+      ctx.host.send('ping', { nonce: `fill-${i}` })
+      expect(await ctx.host.next('pong')).toEqual({ nonce: `fill-${i}` })
+    }
+
+    // Now burst 200 late relay frames (exceeding the 64 frames/sec active cap) on the dropped link:
+    // they are absorbed by the dedicated dropped-link drain budget without touching the active quota.
+    const lateCiphertext = 'A'.repeat(16 * 1024)
+    for (let i = 0; i < 200; i++) {
+      ctx.host.send('relay', {
+        connectionId: ctx.connectionId,
+        targetDeviceId: ctx.c.deviceId,
+        counter: i,
+        ciphertext: lateCiphertext,
+      })
+    }
+
+    // Wait for the 1s rate window to roll over and confirm the Host control connection
+    // was not closed with RATE_LIMITED and received zero error frames.
+    await new Promise(resolve => setTimeout(resolve, 1050))
+    ctx.host.send('ping', { nonce: 'host-survives-stale-burst' })
+    expect(await ctx.host.next('pong')).toEqual({ nonce: 'host-survives-stale-burst' })
+    expect(ctx.host.messages.filter(m => m.type === 'error')).toHaveLength(0)
+    expect(app.gateway.droppedLinkFrameCount(ctx.connectionId)).toBe(200)
+
+    // Even if the same Host subsequently drops >64 links (evicting ctx.connectionId's tombstone),
+    // evictedTombstoneUntil on the Peer still protects late frames for ctx.connectionId.
+    for (let i = 0; i < 70; i++) {
+      gatewayInternals.recordDroppedLink({
+        id: `same-host-churn-${i}`,
+        host: ctx.h.deviceId,
+        client: ctx.c.deviceId,
+      })
+    }
+    expect(app.gateway.droppedLinkFrameCount(ctx.connectionId)).toBe(0)
+    for (let i = 0; i < 100; i++) {
+      ctx.host.send('relay', {
+        connectionId: ctx.connectionId,
+        targetDeviceId: ctx.c.deviceId,
+        counter: 500 + i,
+        ciphertext: lateCiphertext,
+      })
+    }
+    await new Promise(resolve => setTimeout(resolve, 1050))
+    ctx.host.send('ping', { nonce: 'host-survives-post-eviction-burst' })
+    expect(await ctx.host.next('pong')).toEqual({ nonce: 'host-survives-post-eviction-burst' })
+    expect(ctx.host.messages.filter(m => m.type === 'error')).toHaveLength(0)
+
+    // Sustained stale traffic exceeding the 8 MiB/sec dropped-link byte ceiling is still bounded.
+    const hostClosed = once(ctx.host.ws, 'close')
+    const hugeCiphertext = 'B'.repeat(128 * 1024)
+    for (let i = 0; i < 70; i++) {
+      ctx.host.send('relay', {
+        connectionId: ctx.connectionId,
+        targetDeviceId: ctx.c.deviceId,
+        counter: 1000 + i,
+        ciphertext: hugeCiphertext,
+      })
+    }
+    expect(await ctx.host.next('error')).toMatchObject({
+      code: 'RATE_LIMITED',
+      retryable: false,
+    })
+    const [hostCloseCode] = await hostClosed
+    expect(hostCloseCode).toBe(4001)
+  })
+
+  it('enforces configured maxFramesPerSec on active frames and immediately reaps a heartbeat-expired host on connect.request', async () => {
+    await app.close()
+    await start(password, [], { maxFramesPerSec: 64 })
+    accountToken = (await request('/auth/login', 'POST', { email: account, password })).data.token
+    expect(app.gateway.maxFramesPerSec).toBe(64)
+
+    const h = await device('host')
+    const c = await device('client')
+    const rateLimitedClient = await device('client')
+    const hostWire = await socket(h)
+    const clientWire = await socket(c)
+    const noisyWire = await socket(rateLimitedClient)
+    await hostWire.next('hello.ack')
+    await clientWire.next('hello.ack')
+    await noisyWire.next('hello.ack')
+
+    // Simulate a Host whose last pong is older than heartbeatDisconnectMs before
+    // the next periodic interval tick runs.
+    const hostPeer = app.gateway.peers.get(h.deviceId)!
+    hostPeer.lastPong = Date.now() - (app.gateway.heartbeatDisconnectMs + 1000)
+
+    clientWire.send('connect.request', { hostDeviceId: h.deviceId, preferredTransports: ['relay'] })
+    expect(await clientWire.next('error')).toMatchObject({
+      code: 'HOST_OFFLINE',
+      retryable: true,
+    })
+    expect(app.gateway.peers.has(h.deviceId)).toBe(false)
+
+    // Active frames exceeding the configured 64 frames/sec threshold trigger RATE_LIMITED (4001).
+    const noisyClosed = once(noisyWire.ws, 'close')
+    for (let i = 0; i < 70; i++) {
+      noisyWire.send('ping', { nonce: `active-${i}` })
+    }
+    expect(await noisyWire.next('error')).toMatchObject({
+      code: 'RATE_LIMITED',
+      retryable: false,
+    })
+    const [closeCode] = await noisyClosed
+    expect(closeCode).toBe(4001)
   })
 })
