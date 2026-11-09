@@ -6,7 +6,10 @@
 `apps/server` 的补丁。2026-11-08 已合入上游 v0.6.4：SPA 回退（`spaRoute`）与设备改名
 （`POST /devices/:id/name`）自该版本起由上游原生提供，本仓库补丁收敛为：设备移除/恢复
 （`DELETE /devices/:id` → revoke，重新登录即可恢复）、角色 Tab、30 天滑动会话
-（`saveWebSession`）、`/register` 合并鉴权、Dockerfile 换 alpine + npmmirror。这些补丁使
+（`saveWebSession`）、`/register` 合并鉴权、Dockerfile 换 alpine + npmmirror，以及
+未部署 STUN/TURN 时网关通告 Relay-only（`iceAssistedWebRtc`）：上游 0.6.4 无条件通告
+lan/p2p 会让跨网客户端空耗 12 秒 ICE 超时并陷入回退震荡（墓碑吞帧），部署未配置
+`DSH_SERVER_STUN_URLS`/`DSH_SERVER_TURN_URLS` 时保持 0.6.3 的 Relay-only 行为。这些补丁使
 Web 控制台在自部署 Server 上的体验与官方云站一致，**上游 `ghcr.io/.../server` 镜像没有
 移除/恢复、角色 Tab 与滑动会话**，不要用上游镜像替换生产容器。deploy.sh 的镜像自检断言
 `saveWebSession`/`removeMatch`/`spaRoute`，前端 bundle 断言「移除设备」文案。

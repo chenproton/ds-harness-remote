@@ -221,6 +221,7 @@ export function createRemoteServer(config: Config) {
     logLevel: config.logLevel,
     logger: logger.child('gateway'),
     turnEnabled: ice.turnUrls.length > 0,
+    iceAssistedWebRtc: ice.stunUrls.length > 0 || ice.turnUrls.length > 0,
   })
   function descriptor(d: ReturnType<Store['get']>) {
     return { ...d.descriptor, membershipId: `account:${hash(store.account).slice(0, 16)}`, online: gateway.peers.has(d.descriptor.deviceId), lastSeenAt: d.lastSeenAt }

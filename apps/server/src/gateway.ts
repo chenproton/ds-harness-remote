@@ -25,6 +25,8 @@ export interface GatewayOptions extends GatewayTimingOptions {
   logger?: Logger
   /** Advertise `transport.turn` (and accept TURN credential requests). */
   turnEnabled?: boolean
+  /** Advertise direct `transport.lan`/`transport.p2p`; requires a STUN or TURN deployment. */
+  iceAssistedWebRtc?: boolean
 }
 
 /**
@@ -113,6 +115,7 @@ export class Gateway {
   private heartbeat: ReturnType<typeof setInterval>
   private closed = false
   readonly turnEnabled: boolean
+  readonly iceAssistedWebRtc: boolean
   readonly helloTimeoutMs: number
   readonly heartbeatIntervalMs: number
   readonly heartbeatDisconnectMs: number
@@ -132,6 +135,7 @@ export class Gateway {
     this.maxFramesPerSec = normalizeMaxFramesPerSec(options.maxFramesPerSec)
     this.logger = options.logger ?? new Logger('gateway', options.logLevel ?? 'info')
     this.turnEnabled = options.turnEnabled === true
+    this.iceAssistedWebRtc = options.iceAssistedWebRtc === true
 
     store.onInvalidate = id => this.disconnect(id, 'AUTH_INVALID')
     server.on('upgrade', (req, socket, head) => {
@@ -299,6 +303,10 @@ export class Gateway {
     return this.peers.has(link.host) && this.peers.has(link.client)
   }
   private supportedCapabilities(): string[] {
+    // Without a STUN/TURN deployment, cross-network direct connections cannot
+    // succeed: advertising lan/p2p only costs clients a guaranteed ICE timeout
+    // and an unstable relay fallback. Keep the documented Relay-only behavior.
+    if (!this.iceAssistedWebRtc) return ['transport.relay']
     return SUPPORTED_TRANSPORTS.filter(capability => capability !== 'transport.turn' || this.turnEnabled)
   }
   private negotiatedCapabilities(offered: readonly string[]): string[] {
@@ -444,8 +452,8 @@ export class Gateway {
             maxControlFrameBytes: MAX_CONTROL_FRAME_BYTES,
             maxRelayFrameBytes: MAX_RELAY_FRAME_BYTES,
             capabilities: this.negotiatedCapabilities(p.capabilities),
-            webrtcEnabled: true,
-            webrtcFallbackTimeoutMs: WEBRTC_FALLBACK_TIMEOUT_MS,
+            webrtcEnabled: this.iceAssistedWebRtc,
+            webrtcFallbackTimeoutMs: this.iceAssistedWebRtc ? WEBRTC_FALLBACK_TIMEOUT_MS : 1,
           }))
           return
         }

@@ -46,7 +46,9 @@ async function request(path: string, method = 'GET', body?: unknown, token?: str
   return { status: response.status, data: await response.json(), headers: response.headers }
 }
 async function start(pass = password, trustedProxyIps: readonly string[] = [], configOverrides: Partial<Config> = {}) {
-  app = createRemoteServer({ account, password: pass, dataFile: join(dir, 'state.json'), publicUrl: 'http://localhost:8080', trustedProxyIps, ...configOverrides })
+  // Default to a STUN deployment so WebRTC tests exercise the ICE-assisted
+  // path; tests override `ice` explicitly to cover the Relay-only boundary.
+  app = createRemoteServer({ account, password: pass, dataFile: join(dir, 'state.json'), publicUrl: 'http://localhost:8080', trustedProxyIps, ice: parseIceConfig({ DSH_SERVER_STUN_URLS: 'stun:stun.example.test:3478' }), ...configOverrides })
   app.server.listen(0, '127.0.0.1'); await once(app.server, 'listening')
   base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`
 }
@@ -460,6 +462,18 @@ describe('webrtc signaling and TURN credentials', () => {
     const withoutTurn = await socket(await device(), { capabilities: fullCapabilities })
     expect(await withoutTurn.next('hello.ack')).toMatchObject({
       capabilities: ['transport.lan', 'transport.p2p', 'transport.relay'],
+    })
+    await app.close()
+    // Without any STUN/TURN deployment the Server keeps the documented
+    // Relay-only behavior: clients skip hopeless ICE instead of paying a
+    // guaranteed fallback timeout on every cross-network attempt.
+    await start(password, [], { ice: parseIceConfig({}) })
+    accountToken = (await request('/auth/login', 'POST', { email: account, password })).data.token
+    const relayOnly = await socket(await device(), { capabilities: fullCapabilities })
+    expect(await relayOnly.next('hello.ack')).toMatchObject({
+      capabilities: ['transport.relay'],
+      webrtcEnabled: false,
+      webrtcFallbackTimeoutMs: 1,
     })
     await app.close()
     await start(password, [], {
