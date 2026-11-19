@@ -1,48 +1,53 @@
 # Repository Guide for Agents
 
-## 自部署 Server 发布流程（remote.papafeiji.cn，2026-11-08）
+## 自部署 Server 发布流程（remote.papafeiji.cn，2026-11-19）
 
-本仓库 main 是 `SideProject-Tool/ds-harness-remote` 的自托管分支：上游代码 + 一组只作用于
-`apps/server` 的补丁。2026-11-08 已合入上游 v0.6.4：SPA 回退（`spaRoute`）与设备改名
-（`POST /devices/:id/name`）自该版本起由上游原生提供，本仓库补丁收敛为：设备移除/恢复
+本仓库 main 是上游 `liguobao/ds-harness-remote`（remote `upstream`）的自托管分支：上游代码 +
+一组只作用于 `apps/server` 的补丁。2026-11-19 已合入上游 v0.6.6（含 Relay/WebRTC 切换竞态
+修复、无 TURN 时 3 秒直连回退预算、two-phase drain 等）：SPA 回退（`spaRoute`）与设备改名
+（`POST /devices/:id/name`）由上游原生提供，本仓库补丁收敛为：设备移除/恢复
 （`DELETE /devices/:id` → revoke，重新登录即可恢复）、角色 Tab、30 天滑动会话
-（`saveWebSession`）、`/register` 合并鉴权、Dockerfile 换 alpine + npmmirror，以及
-未部署 STUN/TURN 时网关通告 Relay-only（`iceAssistedWebRtc`）：上游 0.6.4 无条件通告
-lan/p2p 会让跨网客户端空耗 12 秒 ICE 超时并陷入回退震荡（墓碑吞帧），部署未配置
-`DSH_SERVER_STUN_URLS`/`DSH_SERVER_TURN_URLS` 时保持 0.6.3 的 Relay-only 行为。这些补丁使
-Web 控制台在自部署 Server 上的体验与官方云站一致，**上游 `ghcr.io/.../server` 镜像没有
-移除/恢复、角色 Tab 与滑动会话**，不要用上游镜像替换生产容器。deploy.sh 的镜像自检断言
-`saveWebSession`/`removeMatch`/`spaRoute`，前端 bundle 断言「移除设备」文案。
+（`saveWebSession`）、`/register` 合并鉴权、Dockerfile 换 alpine + npmmirror（保留上游
+`COPY patches/` 依赖补丁），以及未部署 STUN/TURN 时网关通告 Relay-only
+（`iceAssistedWebRtc`）：部署未配置 `DSH_SERVER_STUN_URLS`/`DSH_SERVER_TURN_URLS` 时
+不通告 lan/p2p/turn（回退预算置 1，保持 Relay-only）；配置了 ICE 时遵循上游语义（无 TURN
+用 3 秒 `DIRECT_ONLY` 预算）。这些补丁使 Web 控制台在自部署 Server 上的体验与官方云站一致，
+**上游 `ghcr.io/.../server` 镜像没有移除/恢复、角色 Tab 与滑动会话**，不要用上游镜像替换
+生产容器。deploy.sh 的镜像自检断言 `saveWebSession`/`removeMatch`/`spaRoute`，前端 bundle
+断言「移除设备」文案。
 
 生产部署：`47.98.121.243`（ssh 别名 `papamemo`，2C2G），`/opt/dsh-remote-server/{compose.yaml,.env}`，
-容器 `dsh-remote-server-server-1` 只监听 `127.0.0.1:8080`，宿主 nginx 反代 443 并持有 Let's
-Encrypt 证书；数据在 docker 卷 `dsh-remote-server_server-data`（`state.json`），**任何操作都不要
-`docker compose down -v`**。
+容器 `dsh-remote-server-server-1` 绑定 `172.17.0.1:8080`（papafeiji-edge nginx 容器可达、
+公网不可达），带 healthcheck 与 `mem_limit: 320m`。2026-11-19 起该机由 papafeiji monorepo
+接管：80/443 由 `papafeiji-nginx` 容器（配置 `/opt/papafeiji/nginx.conf`）持有，`remote.papafeiji.cn`
+的证书与 `upstream dsh_remote → 172.17.0.1:8080` 在该配置内，无需本仓库改动。数据在 docker 卷
+`dsh-remote-server_server-data`（`state.json`），**任何操作都不要 `docker compose down -v`**。
+同日机器重装曾丢失旧数据卷：所有客户端设备凭据随之失效，需重新登录注册。
 
 发布只用仓库根的 `deploy.sh`（在控制机执行，**禁止在 243 上 `docker compose build`**：2G 内存上
 pnpm+vite 构建会把整机拖死，历史上就是这样把机器弄挂并重装的）：
 
 ```bash
 ./deploy.sh                      # tag 自动 <根 package 版本>-g<短 SHA>[-dirty]
-./deploy.sh --tag 0.6.4-custom1  # 指定 tag
+./deploy.sh --tag 0.6.6-custom1  # 指定 tag
 ./deploy.sh --skip-build         # 复用本机镜像，只传输/切换/校验
 ./deploy.sh --no-verify          # 跳过公网校验
 ./deploy.sh --dry-run            # 只打印计划
 ```
 
 脚本流程：`docker build -f apps/server/Dockerfile` → 镜像自检（断言 `dist/server.js` 含
-`devices/rename` 与 `/app/` 回退）→ `docker save | gzip | ssh docker load` → 备份远端
+`saveWebSession`/`removeMatch`/`spaRoute`）→ `docker save | gzip | ssh docker load` → 备份远端
 `compose.yaml` 并改 image tag → `docker compose up -d --force-recreate server` → 等 healthy →
 公网校验 `/`、`/app/login`、`/app/remote`、`/healthz` 与前端 bundle 是否含自托管标记（「移除设备」文案）；
 失败时打印回滚命令。可调环境变量：`DEPLOY_SSH`、`DEPLOY_REMOTE_DIR`、`PUBLIC_URL`。
 
-已知网络约束：控制机 docker daemon 直连 `ghcr.io` 会 `EOF`，拉上游镜像要用 `skopeo`；243 到
-`pkg-containers.githubusercontent.com` 只有约 30 KB/s，所以镜像必须由控制机构建后推送，不要在
-目标机拉取或构建。改 `.env` 后必须 `up -d --force-recreate`，`restart` 不会重载环境变量；
-`DSH_SERVER_PUBLIC_URL` 必须等于浏览器 origin，否则静态资源 403 `AUTH_INVALID` 白屏。
+已知网络约束：控制机 docker daemon 直连 `ghcr.io` 会 `EOF`，拉上游镜像要用 `skopeo`；镜像必须由
+控制机构建后 ssh 推送，不要在目标机拉取或构建。改 `.env` 后必须 `up -d --force-recreate`，
+`restart` 不会重载环境变量；`DSH_SERVER_PUBLIC_URL` 必须等于浏览器 origin，否则静态资源 403
+`AUTH_INVALID` 白屏。
 
-运维细节（证书、nginx、限流、回滚、日志）见控制机
-`/root/DeployOps/ops-docs/dsh-remote-server.md` 与远端 `/opt/dsh-remote-server/DEPLOY.md`。
+运维细节（papafeiji-edge nginx、证书、限流）见 `/opt/papafeiji/nginx.conf` 及其 monorepo
+`deploy/edge/nginx.conf`（唯一权威副本）。
 
 ---
 
