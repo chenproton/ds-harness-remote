@@ -6,8 +6,21 @@ import {
   paginateCodexNativeHistory,
   projectCodexNativeHistory,
 } from '../src/codex/virtual-harness.js'
+import { itemEvents } from '../src/codex/virtual-history.js'
+import { CodexSessionHistoryCache } from '../src/session-history-cache.js'
 
 describe('CodexVirtualHarness', () => {
+  it.each([
+    { summary: ['Checking files'], content: ['Raw trace'], expected: 'Checking files' },
+    { summary: [], content: ['Raw trace'], expected: 'Raw trace' },
+    { summary: ['Checking files'], expected: 'Checking files' },
+  ])('projects reasoning with $expected as a reasoning block', ({ expected, ...item }) => {
+    expect(itemEvents({ type: 'reasoning', id: 'reasoning-1', ...item }, 1, 1)).toMatchObject([{
+      type: 'assistant/message',
+      data: { message: { content: [{ type: 'reasoning', text: expected }] } },
+    }])
+  })
+
   it('forwards CodeX workspace files and terminal calls to the Host carrier', async () => {
     const client = fakeCodex()
     const hostCarrier = {
@@ -1099,6 +1112,44 @@ describe('CodexVirtualHarness', () => {
         }
       },
     })))
+  })
+
+  it('reuses cached Codex history across project switches and falls back to cached pages on transient failures', async () => {
+    const client = fakeCodex()
+    const cache = new CodexSessionHistoryCache()
+    const signal = new AbortController().signal
+    const first = new CodexVirtualHarness(client, { deviceId: 'host_1', name: 'Workstation' }, 'v3', undefined, cache)
+    try {
+      await first.selectWorkspace('codex-workspace:project:repo-project')
+      const [history, projections] = await Promise.all([
+        first.dispatch('session/history', { args: { request: { sessionId: 'codex:thr_1' as never } } }, signal),
+        first.dispatch('session/projections', { args: { request: { sessionId: 'codex:thr_1' as never } } }, signal),
+      ])
+      expect(history).toMatchObject({ ok: true })
+      expect(projections).toMatchObject({ ok: true })
+    } finally {
+      await first.close()
+    }
+    const historyCallsAfterFirstOpen = client.request.mock.calls.filter(call => call[0] === 'dsh/sessionHistory').length
+    expect(historyCallsAfterFirstOpen).toBeLessThanOrEqual(2)
+
+    const second = new CodexVirtualHarness(client, { deviceId: 'host_1', name: 'Workstation' }, 'v3', undefined, cache)
+    try {
+      await second.selectWorkspace('codex-workspace:project:repo-project')
+      await expect(second.dispatch('session/projections', { args: { request: { sessionId: 'codex:thr_1' as never } } }, signal)).resolves.toMatchObject({ ok: true })
+      await expect(second.dispatch('session/history', { args: { request: { sessionId: 'codex:thr_1' as never } } }, signal)).resolves.toMatchObject({ ok: true })
+      expect(client.request.mock.calls.filter(call => call[0] === 'dsh/sessionHistory')).toHaveLength(historyCallsAfterFirstOpen)
+
+      await second.dispatch('session/prompt', { args: { request: { sessionId: 'codex:thr_1' as never, prompt: [{ type: 'text', text: 'next' }] } } }, signal)
+      const original = client.request.getMockImplementation()!
+      client.request.mockImplementation(async (method, params) => {
+        if (method === 'dsh/sessionHistory') throw new Error('network timeout')
+        return original(method, params)
+      })
+      await expect(second.dispatch('session/history', { args: { request: { sessionId: 'codex:thr_1' as never } } }, signal)).resolves.toMatchObject({ ok: true })
+    } finally {
+      await second.close()
+    }
   })
 })
 

@@ -1,6 +1,7 @@
 import { AgentAcpClient } from '@dsh-remote/client-core'
-import type { AcpSessionModels } from '@dsh-remote/protocol'
+import type { AcpAvailableCommand, AcpSessionModels, AcpSessionModes } from '@dsh-remote/protocol'
 import { ACP_TOOL_CALL_ENDPOINTS, ACP_TOOL_STREAM_ENDPOINTS } from '@dsh-remote/protocol'
+import { AcpSessionHistoryCache, type CachedAcpSessionHistory } from '../session-history-cache.js'
 import type { RemoteTypertGatewayTarget, TypertGatewayRequest, TypertRpcResult } from '../typert-gateway-contract.js'
 import type { AcpImage } from './image-content.js'
 import { acpImageContent, acpImageLimits, parseAcpImage } from './image-content.js'
@@ -39,7 +40,7 @@ import {
   success,
 } from './virtual-contract.js'
 import { AcpEventCarrier } from './virtual-event-carrier.js'
-import { AcpLiveProjection } from './virtual-live.js'
+import { AcpLiveProjection, contextPressureProjection } from './virtual-live.js'
 import { AcpSessionTitles } from './virtual-titles.js'
 
 /**
@@ -62,6 +63,8 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
   private readonly pendingApprovals = new Map<string, PendingApproval>()
   private readonly pendingHistory = new Map<string, Promise<void>>()
   private selectedWorkspaceId?: string
+  private lastOpenedSessionId?: string
+  private readonly openedWorkspaceSessions = new Map<string, string>()
   private readonly selectedModels = new Map<string, AcpModelSelection>()
   private readonly selectedPermissions = new Map<string, AcpPermissionPreset>()
   private commandSeq = 0
@@ -69,6 +72,8 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
   private readonly imageAttachments = new Map<string, { sessionId: string; attachment: unknown; data: string }>()
   private closed = false
   private readonly archivedSessionIds = new Set<string>()
+  private readonly pinnedSessionIds = new Set<string>()
+  private readonly workspaceOrder: string[] = []
   private readonly unsubscribeArchived?: () => void
 
   constructor(
@@ -82,10 +87,11 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
      * see `method-not-found` for every global surface and can fail its render.
      */
     private readonly hostCarrier?: RemoteTypertGatewayTarget,
+    private readonly historyCache: AcpSessionHistoryCache = new AcpSessionHistoryCache(),
   ) {
     const owner = this
     this.live = new AcpLiveProjection({
-      ensureSessionRegistered: (...args) => owner.ensureSessionRegistered(...args),
+      lookupSession: (...args) => owner.lookupSession(...args),
       get sessions() { return owner.sessions },
       hydrateSession: (...args) => owner.hydrateSession(...args),
       historyPage: (...args) => owner.historyPage(...args),
@@ -95,7 +101,7 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
       get client() { return owner.client },
       emitRemoteEvent: (...args) => owner.events.emitRemoteEvent(...args),
       get selectedModels() { return owner.selectedModels },
-      publishProjection: (...args) => owner.events.publishProjection(...args),
+      publishProjection: (...args) => owner.publishProjection(...args),
       nextProjectionSeq: (...args) => owner.nextProjectionSeq(...args),
       refreshSessionTitle: (...args) => owner.titles.refresh(...args),
       applySessionTitle: (...args) => owner.titles.applyNative(...args),
@@ -105,6 +111,8 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
       modelSelection: (...args) => owner.modelSelection(...args),
       permissionsProjection: (...args) => owner.permissionsProjection(...args),
       permissionSelection: (...args) => owner.permissionSelection(...args),
+      rememberOpenedSession: sessionId => owner.rememberOpenedSession(sessionId),
+      syncSessionCache: session => owner.syncSessionCache(session),
     })
     this.events = new AcpEventCarrier({
       get archivedSessionIds() { return owner.archivedSessionIds },
@@ -119,10 +127,15 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
       get client() { return owner.client },
       get sessions() { return owner.sessions },
       nextProjectionSeq: (...args) => owner.nextProjectionSeq(...args),
+      get pinnedSessionIds() { return owner.pinnedSessionIds },
     })
 
     this.titles = new AcpSessionTitles(backend, client, this.sessions,
-      (sessionId, title) => this.events.publishProjection(sessionId, 'title', title))
+      (sessionId, title) => {
+        const session = this.sessions.get(sessionId)
+        if (session !== undefined) this.syncSessionCache(session)
+        this.publishProjection(sessionId, 'title', title)
+      })
     this.unsubscribeArchived = client.onSessionArchived?.(data => {
       if (this.closed || data.backend !== this.backend) return
       this.applyArchived(`${sessionPrefix(this.backend)}${data.sessionId}`)
@@ -135,8 +148,30 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     backend: AcpCatalogBackend = "cursor",
     capabilities: readonly string[] = [],
     hostCarrier?: RemoteTypertGatewayTarget,
+    historyCache?: AcpSessionHistoryCache,
   ): AcpVirtualHarness {
-    return new AcpVirtualHarness(new AgentAcpClient(core, capabilities), host, backend, hostCarrier)
+    return new AcpVirtualHarness(new AgentAcpClient(core, capabilities), host, backend, hostCarrier, historyCache)
+  }
+
+  get openedSessionId(): string | undefined {
+    return this.lastOpenedSessionId
+  }
+
+  get openedSessions(): ReadonlyMap<string, string> {
+    return new Map(this.openedWorkspaceSessions)
+  }
+
+  private rememberOpenedSession(sessionId: string): void {
+    if (this.closed) return
+    this.lastOpenedSessionId = sessionId
+    for (const workspace of this.workspaceById.values()) {
+      if (!workspace.sessionIds.includes(sessionId)) continue
+      this.openedWorkspaceSessions.delete(workspace.workspaceId)
+      this.openedWorkspaceSessions.set(workspace.workspaceId, sessionId)
+      if (this.openedWorkspaceSessions.size > 64) {
+        this.openedWorkspaceSessions.delete(this.openedWorkspaceSessions.keys().next().value!)
+      }
+    }
   }
 
   async workspaces(): Promise<AcpVirtualWorkspaceView[]> {
@@ -148,10 +183,17 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     return acpBackendLabel(this.backend)
   }
 
+  private rememberWorkspace(workspace: AcpVirtualWorkspaceView): void {
+    this.workspaceById.set(workspace.workspaceId, workspace)
+    if (!this.workspaceOrder.includes(workspace.workspaceId)) {
+      this.workspaceOrder.push(workspace.workspaceId)
+    }
+  }
+
   async selectWorkspace(workspaceId: string): Promise<AcpVirtualWorkspaceView> {
     const workspace = this.workspaceById.get(workspaceId) ?? recreateWorkspaceFromId(workspaceId, this.backend)
     if (workspace === undefined) throw new Error(`The selected ${this.backendLabel()} workspace is no longer available.`)
-    this.workspaceById.set(workspace.workspaceId, workspace)
+    this.rememberWorkspace(workspace)
     this.selectedWorkspaceId = workspace.workspaceId
     await this.discoverAndAttachSessions(workspace)
     if (workspace.sessionIds.length === 0) {
@@ -161,12 +203,25 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     return this.workspaceById.get(workspace.workspaceId) ?? workspace
   }
 
-  async selectOrCreateWorkspace(path: string): Promise<AcpVirtualWorkspaceView> {
+  async selectOrCreateWorkspace(path: string, title?: string): Promise<AcpVirtualWorkspaceView> {
     const trimmed = path.trim()
     if (trimmed.length === 0) throw new Error(`A ${this.backendLabel()} working directory is required.`)
     const existing = [...this.workspaceById.values()].find(item => item.path === trimmed)
-    const workspace = existing ?? createAcpWorkspaceView(trimmed, this.backend)
-    this.workspaceById.set(workspace.workspaceId, workspace)
+    let persisted: { path: string; title?: string } | undefined
+    if (existing === undefined && this.client.createWorkspace !== undefined) {
+      try {
+        persisted = await this.client.createWorkspace(trimmed, this.backend, title)
+      } catch (err) {
+        const code = err && typeof err === 'object' && 'code' in err ? (err as { code?: unknown }).code : undefined
+        if (code !== 'METHOD_NOT_FOUND' && code !== 'method-not-found' && code !== -32601) {
+          throw err
+        }
+      }
+    }
+    const resolvedPath = persisted?.path ?? trimmed
+    const resolvedTitle = persisted?.title ?? title
+    const workspace = existing ?? createAcpWorkspaceView(resolvedPath, this.backend, resolvedTitle)
+    this.rememberWorkspace(workspace)
     this.selectedWorkspaceId = workspace.workspaceId
     await this.discoverAndAttachSessions(workspace)
     if (workspace.sessionIds.length === 0) {
@@ -176,11 +231,16 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     return this.workspaceById.get(workspace.workspaceId) ?? workspace
   }
 
-  async preferredSessionId(): Promise<string | undefined> {
+  async preferredSessionId(
+    preferredSessionId = this.openedWorkspaceSessions.get(this.selectedWorkspaceId ?? ''),
+  ): Promise<string | undefined> {
     const selected = this.selectedWorkspaceId === undefined
       ? undefined
       : this.workspaceById.get(this.selectedWorkspaceId)
     const sessionIds = selected?.sessionIds ?? []
+    if (preferredSessionId !== undefined && sessionIds.includes(preferredSessionId) && !this.archivedSessionIds.has(preferredSessionId)) {
+      return preferredSessionId
+    }
     let bestSessionId: string | undefined
     let bestUpdatedAt = -1
     for (const sessionId of sessionIds) {
@@ -225,21 +285,21 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
         case 'workspace/list': return business(success({
           items: this.visibleWorkspaces().map(nativeWorkspace),
           archivedSessionIds: [...this.archivedSessionIds],
-          pinnedSessionIds: [],
+          pinnedSessionIds: [...this.pinnedSessionIds],
         }))
         case 'workspace/create': return business(await this.createWorkspace(requestArg(args)))
         case 'workspace/rename': return business(await this.renameWorkspace(requestArg(args)))
-        case 'workspace/delete': return business(failure('workspace-read-only', `${this.backendLabel()} virtual Workspaces cannot be deleted from Desktop yet.`))
-        case 'workspace/insertBefore': return business({
-          workspaceIds: this.visibleWorkspaces().map(item => item.workspaceId),
-        })
+        case 'workspace/delete': return business(await this.deleteWorkspace(requestArg(args)))
+        case 'workspace/insertBefore': return business(await this.reorderWorkspaces(requestArg(args)))
         case 'workspace/insertSessionBefore': return business(await this.workspaceForSession(requestArg(args)))
         case 'workspace/archiveSession': return business(await this.archiveSession(requestArg(args)))
+        case 'workspace/pinSession': return business(await this.pinSession(requestArg(args)))
+        case 'workspace/unpinSession': return business(await this.unpinSession(requestArg(args)))
         case 'session/list': return business(success({ items: await this.handleSessionList() }))
         case 'session/projections': return business(await this.sessionProjections(requestArg(args)))
-        case 'session/search': return business(success({ items: [], hasMore: false }))
+        case 'session/search': return business(success(this.searchSessions(requestArg(args))))
         case 'session/create': return business(await this.createSession(requestArg(args), signal))
-        case 'session/fork': return business(failure('bad-request', `${this.backendLabel()} Remote does not support session fork yet.`))
+        case 'session/fork': return business(await this.forkSession(requestArg(args), signal))
         case 'session/history': return business(await this.sessionHistory(requestArg(args)))
         case 'session/events':
         case 'session/page': return business(await this.sessionPage(requestArg(args)))
@@ -248,6 +308,8 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
         case 'session/rename': return business(await this.renameSession(requestArg(args)))
         case 'session/updateQueue': return business(failure('queue-item-not-found', `${this.backendLabel()} does not expose a DSH inbox queue.`))
         case 'session/attachment': return business(await this.attachment(requestArg(args)))
+        case 'agentPresets/list': return business(await this.agentPresetsList())
+        case 'agentPresets/select': return business(await this.agentPresetSelect(args, signal))
         case 'session/modelCatalog': {
           const sessionId = await this.preferredSessionId()
           const catalog = modelCatalog(this.backend)
@@ -278,14 +340,14 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
         case 'host/describe': return business(success(this.describeHost()))
         case 'host/listDirectory':
         case 'directoryPicker/list': return business(await this.listDirectory(requestArg(args), signal))
-        case 'skills/list': return business(success({ items: [] }))
-        case 'job/kill': return this.hostCarrier === undefined ? business(success({ outcome: 'already-finished' })) : await this.hostCarrier.dispatch(endpoint, payload, signal)
-        case 'commands/list': return business(this.commandList(requestArg(args)))
-        case 'commands/execute': return business(await this.executeCommand(requestArg(args)))
+        case 'skills/list': return business(success({ skills: [] }))
+        case 'job/kill': return business(success({ outcome: 'already-finished' }))
+        case 'commands/list': return business(await this.commandList(requestArg(args)))
+        case 'commands/execute': return business(await this.executeCommand(requestArg(args), signal))
         default:
-          return this.hostCarrier === undefined
-            ? fail('method-not-found', `${this.backendLabel()} virtual Harness does not implement ${endpoint}.`)
-            : await this.hostCarrier.dispatch(endpoint, payload, signal)
+          return this.hostCarrier !== undefined && isAllowedHostCarrierDispatch(endpoint)
+            ? await this.hostCarrier.dispatch(endpoint, payload, signal)
+            : fail('method-not-found', `${this.backendLabel()} virtual Harness does not implement ${endpoint}.`)
       }
     } catch (error) {
       return failFrom(error)
@@ -307,7 +369,9 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     if (endpoint === 'session/follow') return this.live.sessionFollow(requestArg(args), signal)
     if (endpoint === '$events') return this.events.remoteEvents(signal)
     if (endpoint === 'job/list' || endpoint === 'job/follow') return this.events.emptyJobStream(endpoint, signal)
-    if (this.hostCarrier !== undefined) return this.hostCarrier.open(endpoint, payload, signal)
+    if (this.hostCarrier !== undefined && isAllowedHostCarrierOpen(endpoint)) {
+      return this.hostCarrier.open(endpoint, payload, signal)
+    }
     throw Object.assign(new Error(`${this.backendLabel()} virtual Harness does not implement stream ${endpoint}.`), {
       isDSHRemoteError: true as const,
       code: 'method-not-found',
@@ -318,6 +382,11 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
   async close(): Promise<void> {
     if (this.closed) return
     this.closed = true
+    for (const session of this.sessions.values()) {
+      if (session.hydrated || session.events.length > 0) {
+        this.syncSessionCache(session)
+      }
+    }
     this.titles.close()
     this.unsubscribeArchived?.()
     for (const stream of this.workspaceStreams) stream.close()
@@ -329,6 +398,7 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     const follows = [...this.follows]
     this.follows.clear()
     for (const follow of follows) {
+      follow.closed = true
       follow.queue.close()
       await follow.close?.().catch(() => undefined)
     }
@@ -336,21 +406,32 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     this.imageAttachments.clear()
   }
 
+  private hasExplicitWorkspaceOrder = false
+
   private visibleWorkspaces(): AcpVirtualWorkspaceView[] {
     for (const workspace of this.workspaceById.values()) this.sortWorkspaceSessions(workspace)
-    if (this.selectedWorkspaceId === undefined) return [...this.workspaceById.values()]
+    const ordered: AcpVirtualWorkspaceView[] = []
+    for (const id of this.workspaceOrder) {
+      const item = this.workspaceById.get(id)
+      if (item !== undefined) ordered.push(item)
+    }
+    for (const item of this.workspaceById.values()) {
+      if (!ordered.some(existing => existing.workspaceId === item.workspaceId)) ordered.push(item)
+    }
+    if (this.hasExplicitWorkspaceOrder || this.selectedWorkspaceId === undefined) return ordered
     const selected = this.workspaceById.get(this.selectedWorkspaceId)
-    if (selected === undefined) return [...this.workspaceById.values()]
+    if (selected === undefined) return ordered
     return [
       selected,
-      ...[...this.workspaceById.values()].filter(item => item.workspaceId !== selected.workspaceId),
+      ...ordered.filter(item => item.workspaceId !== selected.workspaceId),
     ]
   }
 
   private async createWorkspace(request: JsonRecord): Promise<unknown> {
     const path = string(request.path)?.trim()
-    if (path === undefined || path.length === 0) return failure('bad-request', 'A Cursor working directory is required.')
-    const workspace = await this.selectOrCreateWorkspace(path)
+    const title = string(request.title)?.trim()
+    if (path === undefined || path.length === 0) return failure('bad-request', `A ${this.backendLabel()} working directory is required.`)
+    const workspace = await this.selectOrCreateWorkspace(path, title)
     this.publishWorkspaceBaseline()
     return success({ workspace: nativeWorkspace(workspace), created: true })
   }
@@ -359,12 +440,168 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     const workspaceId = requiredString(request.workspaceId, 'workspaceId')
     const title = string(request.title)?.trim()
     const workspace = this.workspaceById.get(workspaceId)
-    if (workspace === undefined) return failure('workspace-not-found', 'The Cursor virtual Workspace was not found.')
+    if (workspace === undefined) return failure('workspace-not-found', `The ${this.backendLabel()} virtual Workspace was not found.`)
     if (title === undefined || title.length === 0) return failure('bad-request', 'A Workspace name is required.')
+    if (this.client.renameWorkspace !== undefined) {
+      await this.client.renameWorkspace(workspace.path, this.backend, title)
+    }
     const next = { ...workspace, title, updatedAt: new Date().toISOString() }
     this.workspaceById.set(workspaceId, next)
     this.publishWorkspaceBaseline()
     return success({ workspace: nativeWorkspace(next) })
+  }
+
+  private async deleteWorkspace(request: JsonRecord): Promise<unknown> {
+    const workspaceId = requiredString(request.workspaceId, 'workspaceId')
+    const workspace = this.workspaceById.get(workspaceId)
+    if (workspace === undefined) return failure('workspace-not-found', `The ${this.backendLabel()} virtual Workspace was not found.`)
+    if (this.client.deleteWorkspace !== undefined) {
+      await this.client.deleteWorkspace(workspace.path, this.backend)
+    }
+    this.workspaceById.delete(workspaceId)
+    const idx = this.workspaceOrder.indexOf(workspaceId)
+    if (idx !== -1) this.workspaceOrder.splice(idx, 1)
+    if (this.selectedWorkspaceId === workspaceId) {
+      this.selectedWorkspaceId = this.visibleWorkspaces()[0]?.workspaceId
+    }
+    this.publishWorkspaceBaseline()
+    return success({ workspaceIds: this.visibleWorkspaces().map(item => item.workspaceId) })
+  }
+
+  private async reorderWorkspaces(request: JsonRecord): Promise<unknown> {
+    const workspaceId = requiredString(request.workspaceId, 'workspaceId')
+    const beforeWorkspaceId = string(request.beforeWorkspaceId)
+    const current = this.visibleWorkspaces().map(item => item.workspaceId)
+    if (!current.includes(workspaceId)) {
+      return failure('workspace-not-found', `The ${this.backendLabel()} virtual Workspace was not found.`)
+    }
+    const remaining = current.filter(id => id !== workspaceId)
+    const targetIdx = beforeWorkspaceId !== undefined ? remaining.indexOf(beforeWorkspaceId) : -1
+    if (targetIdx === -1) remaining.push(workspaceId)
+    else remaining.splice(targetIdx, 0, workspaceId)
+    this.workspaceOrder.splice(0, this.workspaceOrder.length, ...remaining)
+    this.hasExplicitWorkspaceOrder = true
+    if (this.client.reorderWorkspaces !== undefined) {
+      const paths = remaining
+        .map(id => this.workspaceById.get(id)?.path)
+        .filter((p): p is string => p !== undefined)
+      await this.client.reorderWorkspaces(this.backend, paths)
+    }
+    this.publishWorkspaceBaseline()
+    return success({ workspaceIds: remaining })
+  }
+
+  private async pinSession(request: JsonRecord): Promise<unknown> {
+    const sessionId = this.resolveSessionId(extractSessionId(request))
+    if (this.client.pinSession !== undefined) {
+      const updated = await this.client.pinSession(nativeAcpId(sessionId, this.backend), this.backend)
+      this.pinnedSessionIds.clear()
+      for (const raw of updated) {
+        this.pinnedSessionIds.add(raw.startsWith(sessionPrefix(this.backend)) ? raw : `${sessionPrefix(this.backend)}${raw}`)
+      }
+    } else {
+      this.pinnedSessionIds.add(sessionId)
+    }
+    this.publishWorkspaceBaseline()
+    return success({ pinnedSessionIds: [...this.pinnedSessionIds] })
+  }
+
+  private async unpinSession(request: JsonRecord): Promise<unknown> {
+    const sessionId = this.resolveSessionId(extractSessionId(request))
+    if (this.client.unpinSession !== undefined) {
+      const updated = await this.client.unpinSession(nativeAcpId(sessionId, this.backend), this.backend)
+      this.pinnedSessionIds.clear()
+      for (const raw of updated) {
+        this.pinnedSessionIds.add(raw.startsWith(sessionPrefix(this.backend)) ? raw : `${sessionPrefix(this.backend)}${raw}`)
+      }
+    } else {
+      this.pinnedSessionIds.delete(sessionId)
+    }
+    this.publishWorkspaceBaseline()
+    return success({ pinnedSessionIds: [...this.pinnedSessionIds] })
+  }
+
+  private searchSessions(request: JsonRecord): { items: unknown[]; hasMore: boolean } {
+    const query = (string(request.query) ?? '').trim().toLowerCase()
+    const workspaceId = string(request.workspaceId)
+    const allowedWorkspace = workspaceId !== undefined ? this.workspaceById.get(workspaceId) : undefined
+    const allowedIds = allowedWorkspace !== undefined ? new Set(allowedWorkspace.sessionIds) : undefined
+    const limit = optionalPositiveInteger(request.limit) ?? 30
+    const matched = [...this.sessions.values()]
+      .filter(session => !this.archivedSessionIds.has(session.sessionId))
+      .filter(session => allowedIds === undefined || allowedIds.has(session.sessionId))
+      .filter(session => {
+        if (!query) return true
+        if ((session.title ?? '').toLowerCase().includes(query)) return true
+        if (session.cwd.toLowerCase().includes(query)) return true
+        return session.events.some(entry => {
+          const text = JSON.stringify(entry.event.data ?? '').toLowerCase()
+          return text.includes(query)
+        })
+      })
+      .sort((a, b) => b.updatedAt - a.updatedAt || a.sessionId.localeCompare(b.sessionId))
+    const slice = matched.slice(0, limit).map(session => this.sessionSummary(session, session.projectionSeq ?? -1))
+    return { items: slice, hasMore: matched.length > slice.length }
+  }
+
+  private async forkSession(request: JsonRecord, signal: AbortSignal): Promise<unknown> {
+    const rawId = extractSessionId(request)
+    const source = this.lookupSession(rawId)
+    if (source === undefined) return failure('session-not-found', 'The Session was not found.')
+    if (this.client.forkSession === undefined) {
+      return failure('fork-unavailable', `${this.backendLabel()} Remote does not support session fork yet.`)
+    }
+    const forked = await this.client.forkSession(source.acpSessionId, this.backend, signal)
+    const session = this.registerSession(forked.sessionId, source.cwd, source.title ? `${source.title} (fork)` : undefined, Date.now(), Date.now(), source.blank)
+    if (source.modes !== undefined) session.modes = { ...source.modes }
+    if (source.agentPreset !== undefined) session.agentPreset = source.agentPreset
+    this.attachSessionToWorkspace(source.cwd, session.sessionId)
+    this.publishWorkspaceBaseline()
+    const summarySeq = this.nextProjectionSeq(session.sessionId)
+    this.events.emitRemoteEvent('api-session/added', [this.sessionSummary(session, summarySeq)])
+    this.events.publishProjection(session.sessionId, 'title', session.title ?? this.backendLabel(), this.nextProjectionSeq(session.sessionId))
+    this.events.publishProjection(session.sessionId, 'modelSelection', this.modelSelectionProjection(session.sessionId), this.nextProjectionSeq(session.sessionId))
+    return success({ sessionId: session.sessionId })
+  }
+
+  private async agentPresetsList(): Promise<unknown> {
+    const sessionId = await this.preferredSessionId()
+    if (sessionId === undefined || this.client.sessionModes === undefined) {
+      return success({ presets: [] })
+    }
+    const session = this.sessions.get(sessionId)
+    const modes: AcpSessionModes = session?.modes ?? await this.client.sessionModes(nativeAcpId(sessionId, this.backend), this.backend)
+    if (session !== undefined) {
+      session.modes = modes
+      if (modes.currentModeId) session.agentPreset = modes.currentModeId
+    }
+    const presets = modes.availableModes.map(mode => ({
+      id: mode.id,
+      isDefault: mode.id === 'default' || mode.id === modes.currentModeId,
+      ...(mode.name !== undefined ? { name: mode.name } : {}),
+      ...(mode.description !== undefined ? { description: mode.description } : {}),
+    }))
+    return success({ presets })
+  }
+
+  private async agentPresetSelect(args: JsonRecord, signal: AbortSignal): Promise<unknown> {
+    const req = requestArg(args)
+    const rawId = string(args.agentId) ?? extractSessionId(req)
+    const sessionId = this.resolveSessionId(rawId)
+    const session = this.sessions.get(sessionId)
+    const agentPreset = requiredString(args.agentPreset ?? req.agentPreset ?? req.modeId, 'agentPreset')
+    if (this.client.setMode === undefined) {
+      return failure('mode-unavailable', `${this.backendLabel()} Remote does not support mode switching.`)
+    }
+    const result = await this.client.setMode(nativeAcpId(sessionId, this.backend), this.backend, agentPreset, signal)
+    const committed = result.currentModeId ?? agentPreset
+    if (session !== undefined) {
+      session.agentPreset = committed
+      if (session.modes !== undefined) session.modes = { ...session.modes, currentModeId: committed }
+    }
+    const seq = this.nextProjectionSeq(sessionId)
+    this.events.publishProjection(sessionId, 'agentPreset', committed, seq)
+    return success(committed)
   }
 
   private async workspaceForSession(request: JsonRecord): Promise<unknown> {
@@ -388,6 +625,7 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
 
   private applyArchived(sessionId: string): void {
     this.archivedSessionIds.add(sessionId)
+    this.historyCache.delete(sessionId)
     for (const [workspaceId, workspace] of this.workspaceById) {
       if (!workspace.sessionIds.includes(sessionId)) continue
       const sessionIds = workspace.sessionIds.filter(id => id !== sessionId)
@@ -419,41 +657,27 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     const session = this.registerSession(created.sessionId, cwd, workspace?.title)
     this.attachSessionToWorkspace(cwd, session.sessionId)
     this.publishWorkspaceBaseline()
-    const seq = this.nextProjectionSeq()
-    this.events.emitRemoteEvent('api-session/added', [this.sessionSummary(session, seq)])
-    this.events.publishProjection(session.sessionId, 'title', session.title ?? this.backendLabel(), seq)
-    this.events.publishProjection(session.sessionId, 'modelSelection', this.modelSelectionProjection(session.sessionId), seq)
+    const summarySeq = this.nextProjectionSeq(session.sessionId)
+    this.events.emitRemoteEvent('api-session/added', [this.sessionSummary(session, summarySeq)])
+    this.events.publishProjection(session.sessionId, 'title', session.title ?? this.backendLabel(), this.nextProjectionSeq(session.sessionId))
+    this.events.publishProjection(session.sessionId, 'modelSelection', this.modelSelectionProjection(session.sessionId), this.nextProjectionSeq(session.sessionId))
     return success({ sessionId: session.sessionId })
   }
 
-  private ensureSessionRegistered(sessionId: string): AcpSessionState | undefined {
-    let session = this.sessions.get(sessionId)
-    if (session !== undefined) return session
-    const prefix = sessionPrefix(this.backend)
+  private lookupSession(sessionId: string): AcpSessionState | undefined {
+    const direct = this.sessions.get(sessionId)
+    if (direct !== undefined) return direct
     if (this.backend !== 'cursor') {
-      if (sessionId.startsWith(prefix)) {
-        const acpSessionId = sessionId.slice(prefix.length)
-        const workspace = this.selectedWorkspaceId !== undefined ? this.workspaceById.get(this.selectedWorkspaceId) : undefined
-        const cwd = workspace?.path ?? '/'
-        session = this.registerSession(acpSessionId, cwd, this.backendLabel(), Date.now(), Date.now(), false)
-        if (workspace && !workspace.sessionIds.includes(sessionId)) {
-          workspace.sessionIds.unshift(sessionId)
-          workspace.sessionCount = workspace.sessionIds.length
-          this.publishWorkspaceBaseline()
-        }
-        return session
-      }
-      const prefixed = `${prefix}${sessionId}`
-      const found = this.sessions.get(prefixed)
-      if (found !== undefined) return found
+      return this.sessions.get(`${sessionPrefix(this.backend)}${sessionId}`)
     }
     return undefined
   }
 
   private async prompt(request: JsonRecord, signal: AbortSignal): Promise<unknown> {
-    const sessionId = extractSessionId(request)
-    const session = this.ensureSessionRegistered(sessionId) ?? this.sessions.get(sessionId)
+    const requestedId = extractSessionId(request)
+    const session = this.lookupSession(requestedId)
     if (session === undefined) return failure('session-not-found', 'The Session was not found.')
+    const sessionId = session.sessionId
     await this.hydrateSession(session)
     const text = extractPromptText(array(request.content))
     let images: AcpImage[]
@@ -463,12 +687,32 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     } catch { return failure('attachment-error', 'Invalid or unsupported image attachment.') }
     if (text === undefined && images.length === 0) return failure('attachment-error', 'A prompt or image is required.')
     const imageBlocks = images.map(image => acpImageContent(image, `agy-image:${crypto.randomUUID()}.${image.mimeType === 'image/jpeg' ? 'jpg' : image.mimeType.slice(6)}`))
+    const hadFollow = [...this.follows].some(f => f.sessionId === sessionId)
+    const prevEventsLen = session.events.length
+    const prevBlank = session.blank
+    const prevHydrated = session.hydrated
+    const prevRunning = session.running
+    const prevUpdatedAt = session.updatedAt
+    const prevTitle = session.title
+    const prevTitleFromPrompt = session.titleFromPrompt
+    const prevTitleOverridden = session.titleOverridden
+    const prevAttachmentIds = new Set(this.imageAttachments.keys())
     this.cacheImageAttachments(sessionId, imageBlocks)
     const requestId = typeof request.requestId === 'string' && request.requestId.length > 0
       ? request.requestId
       : undefined
-    await this.live.ensureFollow(session)
+    try {
+      await this.live.ensureFollow(session)
+    } catch (error) {
+      for (const id of [...this.imageAttachments.keys()]) {
+        if (!prevAttachmentIds.has(id)) this.imageAttachments.delete(id)
+      }
+      throw error
+    }
     const follow = [...this.follows].find(f => f.sessionId === sessionId)
+    const prevTurn = follow?.turn
+    const prevStepOpen = follow?.stepOpen
+    const prevNextSeq = follow?.nextSeq
     if (follow !== undefined) {
       follow.turn += 1
       follow.stepOpen = true
@@ -483,18 +727,65 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     }
     this.titles.applyPrompt(session, text)
     session.blank = false
+    session.hydrated = true
     session.running = true
     session.updatedAt = Date.now()
+    this.syncSessionCache(session)
     this.events.emitRemoteEvent('api-session/status', [sessionId, true])
     this.publishWorkspaceBaseline()
-    await this.client.prompt(session.acpSessionId, text ?? '', signal, images, this.backend)
+    try {
+      await this.client.prompt(session.acpSessionId, text ?? '', signal, images, this.backend)
+    } catch (error) {
+      if (!follow?.streamActive && session.events.length === prevEventsLen + 3) {
+        session.events.length = prevEventsLen
+        session.blank = prevBlank
+        session.hydrated = prevHydrated
+        session.running = prevRunning
+        session.updatedAt = prevUpdatedAt
+        const titleChanged = session.title !== prevTitle
+        session.title = prevTitle
+        session.titleFromPrompt = prevTitleFromPrompt
+        session.titleOverridden = prevTitleOverridden
+        if (titleChanged) {
+          this.publishProjection(sessionId, 'title', prevTitle ?? this.backendLabel())
+        }
+        for (const id of [...this.imageAttachments.keys()]) {
+          if (!prevAttachmentIds.has(id)) this.imageAttachments.delete(id)
+        }
+        if (follow !== undefined) {
+          follow.turn = prevTurn!
+          follow.stepOpen = prevStepOpen!
+          follow.nextSeq = prevNextSeq!
+          if (!hadFollow || follow.hasConsumer) {
+            follow.closed = true
+            this.follows.delete(follow)
+            follow.queue.close()
+            void follow.close?.().catch(() => undefined)
+          }
+        }
+      } else {
+        session.running = false
+        if (follow !== undefined && !follow.closed && (follow.stepOpen || follow.streamActive)) {
+          const code = error instanceof Error && 'code' in error && typeof error.code === 'string'
+            ? error.code
+            : 'ACP_PROMPT_FAILED'
+          const message = error instanceof Error ? error.message : String(error)
+          this.live.closeFollowAfterRemoteStreamClosed(follow, { kind: 'error', error: { code, message } })
+        }
+      }
+      this.events.emitRemoteEvent('api-session/status', [sessionId, false])
+      this.syncSessionCache(session)
+      this.publishWorkspaceBaseline()
+      throw error
+    }
     return success({ accepted: true })
   }
 
   private async cancel(request: JsonRecord, signal: AbortSignal): Promise<unknown> {
-    const sessionId = extractSessionId(request)
-    const session = this.ensureSessionRegistered(sessionId) ?? this.sessions.get(sessionId)
+    const requestedId = extractSessionId(request)
+    const session = this.lookupSession(requestedId)
     if (session === undefined) return failure('session-not-found', 'The Session was not found.')
+    const sessionId = session.sessionId
     await this.client.cancel(session.acpSessionId, signal)
     session.running = false
     for (const follow of this.follows) {
@@ -502,21 +793,24 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
         this.live.closeFollowAfterRemoteStreamClosed(follow, { kind: 'aborted', reason: { kind: 'user' } })
       }
     }
+    this.syncSessionCache(session)
     this.events.emitRemoteEvent('api-session/status', [sessionId, false])
     return success({ accepted: true })
   }
 
   private async renameSession(request: JsonRecord): Promise<unknown> {
-    const sessionId = extractSessionId(request)
+    const requestedId = extractSessionId(request)
     const title = string(request.title)?.trim()
-    const session = this.ensureSessionRegistered(sessionId) ?? this.sessions.get(sessionId)
+    const session = this.lookupSession(requestedId)
     if (session === undefined) return failure('session-not-found', 'The Session was not found.')
-    if (title === undefined) return failure('bad-request', 'A Session title is required.')
+    if (!title) return failure('bad-request', 'A Session title is required.')
     session.title = title
     session.titleOverridden = true
     session.updatedAt = Date.now()
-    this.events.publishProjection(sessionId, 'title', title)
-    return success({ sessionId })
+    this.syncSessionCache(session)
+    const seq = this.nextProjectionSeq(session.sessionId)
+    this.events.publishProjection(session.sessionId, 'title', title, seq)
+    return success({ title, seq })
   }
 
   private cacheImageAttachments(sessionId: string, content: unknown[]): void {
@@ -530,20 +824,24 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
   }
 
   private async attachment(request: JsonRecord): Promise<unknown> {
-    const sessionId = extractSessionId(request)
+    const requestedId = extractSessionId(request)
     // 0.2.2 sends the full ImageAttachmentRef; older clients send only its id.
     const attachmentId = string(request.attachmentId)
       ?? string(record(request.attachment).attachmentId)
-    const session = this.ensureSessionRegistered(sessionId)
+    const session = this.lookupSession(requestedId)
     if ((this.backend !== 'antigravity' && this.backend !== 'hermes') || session === undefined || !attachmentId?.startsWith('agy-image:')) return failure('attachment-error', 'The image is not referenced by this Session.')
     await this.hydrateSession(session)
     const cached = this.imageAttachments.get(attachmentId)
-    return cached?.sessionId === sessionId ? success({ attachment: cached.attachment, data: cached.data }) : failure('attachment-error', 'The image attachment is unavailable or expired.')
+    return cached?.sessionId === session.sessionId ? success({ attachment: cached.attachment, data: cached.data }) : failure('attachment-error', 'The image attachment is unavailable or expired.')
   }
 
   private async hydrateSession(session: AcpSessionState): Promise<void> {
-    if (this.backend === 'cursor' || session.blank || session.events.length > 0) return
-    if (this.backend !== 'pi') return this.hydrateSessionOnce(session)
+    if (session.blank || (session.events.length > 0 && !session.staleHistory)) return
+    const cached = this.historyCache.getFresh(session.sessionId)
+    if (cached !== undefined && (!Number.isFinite(session.updatedAt) || session.updatedAt === cached.hostUpdatedAt)) {
+      this.restoreCachedSession(session, cached, false)
+      return
+    }
     const pending = this.pendingHistory.get(session.sessionId)
     if (pending) return pending
     const read = this.hydrateSessionOnce(session)
@@ -553,10 +851,37 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
 
   private async hydrateSessionOnce(session: AcpSessionState): Promise<void> {
     let events: unknown[] = []
-    if (this.client.loadSessionHistory !== undefined) {
+    if (this.client.loadSessionDetails !== undefined) {
+      try {
+        const details = await this.client.loadSessionDetails(session.sessionId, this.backend)
+        events = details.events
+        if (details.modes !== undefined) {
+          session.modes = details.modes
+          if (details.modes.currentModeId) session.agentPreset = details.modes.currentModeId
+        }
+        if (details.availableCommands !== undefined) {
+          session.availableCommands = details.availableCommands
+        }
+        if (details.permissionPreset !== undefined && isAcpPermissionPreset(details.permissionPreset) && !this.selectedPermissions.has(session.sessionId)) {
+          this.selectedPermissions.set(session.sessionId, details.permissionPreset)
+        }
+      } catch (error) {
+        const stale = this.historyCache.getStale(session.sessionId)
+        if (stale !== undefined && stale.events.length > 0) {
+          this.restoreCachedSession(session, stale, true)
+          return
+        }
+        if (this.backend === 'pi' || this.backend === 'claude' || this.backend === 'opencode' || this.backend === 'hermes') throw error
+      }
+    } else if (this.client.loadSessionHistory !== undefined) {
       try {
         events = await this.client.loadSessionHistory(session.sessionId, this.backend)
       } catch (error) {
+        const stale = this.historyCache.getStale(session.sessionId)
+        if (stale !== undefined && stale.events.length > 0) {
+          this.restoreCachedSession(session, stale, true)
+          return
+        }
         // A failed history read is not a successful empty baseline; do not continue
         // a restored conversation until its authoritative history is available.
         if (this.backend === 'pi' || this.backend === 'claude' || this.backend === 'opencode' || this.backend === 'hermes') throw error
@@ -564,50 +889,104 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
       }
     }
     if (events.length > 0) {
+      session.hydrated = true
+      session.staleHistory = false
       session.events = events as unknown as Array<{ type: 'event'; event: NativeEvent }>
       const firstUser = session.events.find(entry => entry.event.type === 'user/message')
       this.titles.applyPrompt(session, extractPromptText(array(record(firstUser?.event.data).content)))
       session.blank = false
       for (const event of session.events) this.cacheImageAttachments(session.sessionId, array(record(event.event.data).content ?? record(record(event.event.data).message).content))
+      this.syncSessionCache(session)
     }
   }
 
+  private restoreCachedSession(session: AcpSessionState, cached: CachedAcpSessionHistory, staleFallback: boolean): void {
+    session.events = cached.events
+    session.hydrated = !staleFallback && !cached.stale && !cached.truncated
+    session.staleHistory = staleFallback || Boolean(cached.stale) || Boolean(cached.truncated)
+    session.blank = cached.blank
+    if (cached.title !== undefined && (!session.titleOverridden || cached.titleOverridden)) {
+      session.title = cached.title
+      session.titleOverridden = cached.titleOverridden
+      session.titleFromPrompt = cached.titleFromPrompt
+    }
+    if (cached.selectedModel !== undefined && !this.selectedModels.has(session.sessionId)) {
+      this.selectedModels.set(session.sessionId, cached.selectedModel)
+    }
+    if (cached.permissionPreset !== undefined && !this.selectedPermissions.has(session.sessionId)) {
+      this.selectedPermissions.set(session.sessionId, cached.permissionPreset)
+    }
+    for (const event of session.events) {
+      this.cacheImageAttachments(session.sessionId, array(record(event.event.data).content ?? record(record(event.event.data).message).content))
+    }
+  }
+
+  private syncSessionCache(session: AcpSessionState): void {
+    const existing = this.historyCache.getStale(session.sessionId)
+    const isStale = Boolean(session.running || session.staleHistory)
+    const hostUpdatedAt = session.staleHistory && existing !== undefined
+      ? existing.hostUpdatedAt
+      : session.updatedAt
+    const selectedModel = this.selectedModels.get(session.sessionId)
+    const permissionPreset = this.selectedPermissions.get(session.sessionId)
+    this.historyCache.set(session.sessionId, {
+      events: session.events,
+      blank: session.blank && session.events.length === 0,
+      hydrated: Boolean((session.hydrated || session.events.length > 0) && !session.staleHistory),
+      stale: isStale,
+      ...(session.title === undefined ? {} : { title: session.title }),
+      ...(session.titleOverridden === undefined ? {} : { titleOverridden: session.titleOverridden }),
+      ...(session.titleFromPrompt === undefined ? {} : { titleFromPrompt: session.titleFromPrompt }),
+      hostUpdatedAt,
+      ...(selectedModel === undefined ? {} : { selectedModel }),
+      ...(permissionPreset === undefined ? {} : { permissionPreset }),
+    })
+  }
+
   private async sessionHistory(request: JsonRecord): Promise<unknown> {
-    const sessionId = extractSessionId(request)
-    const session = this.ensureSessionRegistered(sessionId) ?? this.sessions.get(sessionId)
+    const requestedId = extractSessionId(request)
+    const session = this.lookupSession(requestedId)
     if (session === undefined) return failure('session-not-found', 'The Session was not found.')
+    const sessionId = session.sessionId
     await this.hydrateSession(session)
+    const beforeSeq = optionalInteger(request.beforeSeq)
+    if (beforeSeq === undefined) {
+      this.rememberOpenedSession(sessionId)
+    }
     const page = this.historyPage(session, {
-      beforeSeq: optionalInteger(request.beforeSeq),
+      beforeSeq,
       limit: optionalPositiveInteger(request.maxMessages) ?? 50,
     })
     return success({
       ...page,
       events: page.records.map(entry => ({ event: entry.event })),
       projections: {
-        asOfSeq: page.cursor,
+        asOfSeq: session.projectionSeq ?? -1,
         values: {
           title: session.title ?? acpBackendLabel(this.backend),
           sessionListMetadata: { blank: session.blank && session.events.length === 0, lastPromptAt: null },
           modelSelection: this.modelSelectionProjection(sessionId),
           permissions: this.permissionsProjection(sessionId),
           imageLimits: acpImageLimits(this.backend),
+          ...(session.agentPreset !== undefined ? { agentPreset: session.agentPreset } : {}),
+          ...(session.todos !== undefined ? { todos: session.todos } : {}),
+          ...(session.contextUsage !== undefined ? { contextPressure: contextPressureProjection(session.contextUsage) } : {}),
         },
       },
     })
   }
 
   private async sessionProjections(request: JsonRecord): Promise<unknown> {
-    const sessionId = extractSessionId(request)
-    const session = this.ensureSessionRegistered(sessionId) ?? this.sessions.get(sessionId)
+    const requestedId = extractSessionId(request)
+    const session = this.lookupSession(requestedId)
     if (session === undefined) return success(null)
     await this.hydrateSession(session)
-    return success(this.sessionSummary(session, session.events.at(-1)?.event.seq ?? -1).projections)
+    return success(this.sessionSummary(session, session.projectionSeq ?? -1).projections)
   }
 
   private async sessionPage(request: JsonRecord): Promise<unknown> {
-    const sessionId = extractSessionId(request)
-    const session = this.ensureSessionRegistered(sessionId) ?? this.sessions.get(sessionId)
+    const requestedId = extractSessionId(request)
+    const session = this.lookupSession(requestedId)
     if (session === undefined) return failure('session-not-found', 'The Session was not found.')
     await this.hydrateSession(session)
     const page = this.historyPage(session, {
@@ -696,16 +1075,15 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
   }
 
   private async discoverAndAttachSessions(workspace: AcpVirtualWorkspaceView): Promise<void> {
-    if (this.backend === 'cursor') return
     const previousTitles = new Map([...this.sessions].map(([id, session]) => [id, session.title]))
     try {
-      let discovered: Array<{ conversationId: string; title: string; createdAt: number; updatedAt: number }> = []
+      let discovered: Array<{ conversationId: string; title: string; createdAt: number; updatedAt: number; pinned?: boolean }> = []
       if (this.client.listSessions !== undefined) {
         try {
           discovered = await this.client.listSessions(workspace.path, this.backend, 30)
         } catch (error) {
           if (this.backend === 'pi' || this.backend === 'claude' || this.backend === 'hermes') throw error
-          // Preserve legacy AGY catalog availability behavior.
+          // Preserve legacy AGY/Cursor catalog availability behavior.
         }
       }
       for (const item of discovered) {
@@ -721,6 +1099,7 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
             this.titles.applyNative(existing, item.title)
           }
         }
+        if (item.pinned) this.pinnedSessionIds.add(sessionId)
         if (!this.archivedSessionIds.has(sessionId) && !workspace.sessionIds.includes(sessionId)) {
           workspace.sessionIds.push(sessionId)
         }
@@ -730,7 +1109,7 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
       workspace.updatedAt = new Date().toISOString()
     } catch (error) {
       if (this.backend === 'pi' || this.backend === 'claude' || this.backend === 'hermes') throw error
-      // Preserve legacy AGY catalog availability behavior.
+      // Preserve legacy AGY/Cursor catalog availability behavior.
     }
   }
 
@@ -744,7 +1123,7 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
       sessionCount: sessionIds.length,
       updatedAt: new Date().toISOString(),
     }
-    this.workspaceById.set(next.workspaceId, next)
+    this.rememberWorkspace(next)
     if (this.selectedWorkspaceId === undefined) this.selectedWorkspaceId = next.workspaceId
   }
 
@@ -755,10 +1134,10 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     const title = this.backend === 'antigravity' ? 'Antigravity' : this.backend === 'opencode' ? 'OpenCode' : workspace.title
     const session = this.registerSession(sessionId, cwd, title)
     this.attachSessionToWorkspace(cwd, session.sessionId)
-    const seq = this.nextProjectionSeq()
-    this.events.emitRemoteEvent('api-session/added', [this.sessionSummary(session, seq)])
-    this.events.publishProjection(session.sessionId, 'title', session.title ?? this.backendLabel(), seq)
-    this.events.publishProjection(session.sessionId, 'modelSelection', this.modelSelectionProjection(session.sessionId), seq)
+    const summarySeq = this.nextProjectionSeq(session.sessionId)
+    this.events.emitRemoteEvent('api-session/added', [this.sessionSummary(session, summarySeq)])
+    this.events.publishProjection(session.sessionId, 'title', session.title ?? this.backendLabel(), this.nextProjectionSeq(session.sessionId))
+    this.events.publishProjection(session.sessionId, 'modelSelection', this.modelSelectionProjection(session.sessionId), this.nextProjectionSeq(session.sessionId))
     this.publishWorkspaceBaseline()
     return session
   }
@@ -781,7 +1160,7 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     return [...this.sessions.values()]
       .filter(session => allowed.has(session.sessionId) && !this.archivedSessionIds.has(session.sessionId))
       .sort((a, b) => b.updatedAt - a.updatedAt || a.sessionId.localeCompare(b.sessionId))
-      .map(session => this.sessionSummary(session, 0))
+      .map(session => this.sessionSummary(session, session.projectionSeq ?? -1))
   }
 
   private sortWorkspaceSessions(workspace: AcpVirtualWorkspaceView): void {
@@ -806,6 +1185,9 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
           modelSelection: this.modelSelectionProjection(session.sessionId),
           permissions: this.permissionsProjection(session.sessionId),
           imageLimits: acpImageLimits(this.backend),
+          ...(session.agentPreset !== undefined ? { agentPreset: session.agentPreset } : {}),
+          ...(session.todos !== undefined ? { todos: session.todos } : {}),
+          ...(session.contextUsage !== undefined ? { contextPressure: contextPressureProjection(session.contextUsage) } : {}),
         },
       },
     }
@@ -850,49 +1232,93 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
       this.selectedPermissions.set(resolved, preset)
       this.selectedPermissions.set(sessionId, preset)
     }
-    const seq = this.nextProjectionSeq()
+    const seq = this.nextProjectionSeq(resolved)
     this.events.publishProjection(resolved, 'permissions', this.permissionsProjection(resolved), seq)
     if (resolved !== sessionId) {
       this.events.publishProjection(sessionId, 'permissions', this.permissionsProjection(resolved), seq)
     }
+    const session = this.sessions.get(resolved)
+    if (session !== undefined) this.syncSessionCache(session)
     if (this.client.selectPermission) {
       void this.client.selectPermission(nativeAcpId(resolved, this.backend), this.backend, preset ?? 'workspace-write').catch(() => undefined)
     }
   }
 
-  private commandList(args: JsonRecord): unknown[] {
+  private async commandList(args: JsonRecord): Promise<AcpAvailableCommand[]> {
     const rawId = extractSessionId(args)
-    if (rawId) this.resolveSessionId(rawId)
-    return [{
-      name: 'permission',
-      description: `Switch the ${this.backendLabel()} Remote sandbox mode and approval policy`,
-      input: { hint: '<preset>' },
-    }]
+    const sessionId = rawId ? this.resolveSessionId(rawId) : undefined
+    const session = sessionId ? this.sessions.get(sessionId) : undefined
+    const base: AcpAvailableCommand[] = [
+      {
+        name: 'permission',
+        description: `Switch the ${this.backendLabel()} Remote sandbox mode and approval policy`,
+        input: { hint: '<preset>' },
+      },
+    ]
+    let remote = session?.availableCommands ?? []
+    if (remote.length === 0 && sessionId !== undefined && this.client.sessionCommands !== undefined) {
+      try {
+        remote = await this.client.sessionCommands(nativeAcpId(sessionId, this.backend), this.backend)
+        if (session !== undefined && remote.length > 0) session.availableCommands = remote
+      } catch { /* Graceful fallback to local commands if upstream does not expose session commands. */ }
+    }
+    const merged: AcpAvailableCommand[] = [...base]
+    for (const cmd of remote) {
+      if (merged.some(item => item.name === cmd.name)) continue
+      const hint = typeof cmd.input?.hint === 'string' ? cmd.input.hint : undefined
+      merged.push({
+        name: cmd.name,
+        description: cmd.description ?? `Run /${cmd.name} on ${this.backendLabel()}`,
+        ...(hint !== undefined ? { input: { hint } } : {}),
+      })
+    }
+    if ((this.client.sessionCommands !== undefined || remote.length > 0) && !merged.some(item => item.name === 'compact')) {
+      merged.push({
+        name: 'compact',
+        description: `Compact conversation history in ${this.backendLabel()}`,
+      })
+    }
+    return merged
   }
 
-  private async executeCommand(args: JsonRecord): Promise<unknown> {
+  private async executeCommand(args: JsonRecord, signal?: AbortSignal): Promise<unknown> {
     const rawId = requiredString(args.agentId ?? args.sessionId, 'agentId')
     const sessionId = this.resolveSessionId(rawId)
+    const session = this.sessions.get(sessionId)
     const line = requiredString(args.line, 'command line').trim()
-    const match = /^\/permission(?:\s+([\s\S]*))?$/u.exec(line)
-    if (match === null) return undefined
+    const permissionMatch = /^\/permission(?:\s+([\s\S]*))?$/u.exec(line)
+    if (permissionMatch !== null) {
+      const commandId = `acp-permission:${++this.commandSeq}`
+      const requested = (permissionMatch[1] ?? '').trim()
+      if (requested === '') {
+        return {
+          commandId,
+          result: { kind: 'success', text: `current preset ${this.permissionSelection(sessionId) ?? 'Host settings (not reported)'}` },
+        }
+      }
+      if (!isAcpPermissionPreset(requested)) {
+        return {
+          commandId,
+          result: { kind: 'error', text: `unknown preset "${requested}" (available: workspace-write, danger-full-access)` },
+        }
+      }
+      this.setPermissionSelection(sessionId, requested)
+      return { commandId, result: { kind: 'success', text: `preset ${requested}` } }
+    }
 
-    const commandId = `acp-permission:${++this.commandSeq}`
-    const requested = (match[1] ?? '').trim()
-    if (requested === '') {
-      return {
-        commandId,
-        result: { kind: 'success', text: `current preset ${this.permissionSelection(sessionId) ?? 'Host settings (not reported)'}` },
-      }
+    const slashMatch = /^\/([a-zA-Z0-9_-]+)(?:\s+([\s\S]*))?$/u.exec(line)
+    if (slashMatch === null || session === undefined) return undefined
+    const commandName = slashMatch[1]!.toLowerCase()
+    const upstreamNames = new Set((session.availableCommands ?? []).map(cmd => cmd.name.toLowerCase()))
+    if (commandName !== 'compact' && !upstreamNames.has(commandName)) {
+      return undefined
     }
-    if (!isAcpPermissionPreset(requested)) {
-      return {
-        commandId,
-        result: { kind: 'error', text: `unknown preset "${requested}" (available: workspace-write, danger-full-access)` },
-      }
-    }
-    this.setPermissionSelection(sessionId, requested)
-    return { commandId, result: { kind: 'success', text: `preset ${requested}` } }
+    const commandId = `acp-command:${++this.commandSeq}`
+    await this.prompt(
+      { sessionId, content: [{ type: 'text', text: line }] },
+      signal ?? new AbortController().signal,
+    )
+    return { commandId, result: { kind: 'success', text: `Ran ${line}` } }
   }
 
   private async hostSessionModels(sessionId: string): Promise<AcpSessionModels> {
@@ -940,7 +1366,9 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
     const confirmed = await this.client.selectModel(nativeAcpId(sessionId, this.backend), this.backend, selected)
     this.selectedModels.set(sessionId, confirmed)
     if (rawSessionId && rawSessionId !== sessionId) this.selectedModels.set(rawSessionId, confirmed)
-    const seq = this.nextProjectionSeq()
+    const session = this.sessions.get(sessionId)
+    if (session !== undefined) this.syncSessionCache(session)
+    const seq = this.nextProjectionSeq(sessionId)
     this.events.publishProjection(sessionId, 'modelSelection', this.modelSelectionProjection(sessionId), seq)
     if (rawSessionId && rawSessionId !== sessionId) {
       this.events.publishProjection(rawSessionId, 'modelSelection', this.modelSelectionProjection(sessionId), seq)
@@ -954,13 +1382,55 @@ export class AcpVirtualHarness implements RemoteTypertGatewayTarget {
         queue.push({ type: 'upsert', workspace: nativeWorkspace(workspace) })
       }
       queue.push({ type: 'archived', archivedSessionIds: [...this.archivedSessionIds] })
+      queue.push({ type: 'pinned', pinnedSessionIds: [...this.pinnedSessionIds] })
     }
   }
 
-  private nextProjectionSeq(): number {
+  private publishProjection(
+    sessionId: string,
+    key: string,
+    value: unknown,
+    seq = this.nextProjectionSeq(sessionId),
+  ): void {
+    this.events.publishProjection(sessionId, key, value, seq)
+  }
+
+  private nextProjectionSeq(sessionId?: string): number {
     this.lastProjectionSeq += 1
+    if (sessionId !== undefined) {
+      const session = this.lookupSession(sessionId)
+      if (session !== undefined) session.projectionSeq = this.lastProjectionSeq
+    }
     return this.lastProjectionSeq
   }
+}
+
+const ALLOWED_HOST_CARRIER_DISPATCH_PREFIXES = [
+  'settings/',
+  'pluginManager/',
+  'pluginMarket/',
+  'pluginRecommendations/',
+  'pluginRegistryProbe/',
+  'credentials/',
+  'llm/',
+  'speech/',
+  'account/',
+] as const
+
+const ALLOWED_HOST_CARRIER_DISPATCH_EXACT = new Set([
+  'pluginInventory/list',
+  'permissionPresets/catalog',
+])
+
+function isAllowedHostCarrierDispatch(endpoint: string): boolean {
+  return ALLOWED_HOST_CARRIER_DISPATCH_EXACT.has(endpoint)
+    || ALLOWED_HOST_CARRIER_DISPATCH_PREFIXES.some(prefix => endpoint.startsWith(prefix))
+}
+
+function isAllowedHostCarrierOpen(endpoint: string): boolean {
+  return endpoint === 'remoteAccess/follow'
+    || endpoint.startsWith('account/')
+    || endpoint.startsWith('settings/')
 }
 
 export { acpCwdWorkspaceId, createAcpWorkspaceView, discoverAcpVirtualWorkspaces, modelCatalog } from './virtual-catalog.js'

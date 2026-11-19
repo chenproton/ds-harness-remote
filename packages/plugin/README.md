@@ -2,7 +2,9 @@
 
 Continue DeepSeek Harness sessions and experimental Codex, Cursor, and Antigravity workspaces from another device over an end-to-end encrypted connection.
 
-[GitHub](https://github.com/liguobao/ds-harness-remote) · [Full guide](https://github.com/liguobao/ds-harness-remote/blob/main/README.md) · [中文说明](https://github.com/liguobao/ds-harness-remote/blob/main/README.zh.md) · [Remote Web](https://dsh.r2049.cn/app) · [Android](https://github.com/liguobao/ds-harness-remote/releases/latest)
+[GitHub](https://github.com/liguobao/ds-harness-remote) · [Full guide](https://github.com/liguobao/ds-harness-remote/blob/main/README.md) · [中文说明](https://github.com/liguobao/ds-harness-remote/blob/main/README.zh.md) · [Remote Web](https://dsh.r2049.cn/app) · [iOS beta](https://github.com/liguobao/ds-harness-remote/issues/20) · [Android](https://github.com/liguobao/ds-harness-remote/releases/latest) · [DSH Go](https://github.com/ccch1mneyyy/dsh-go)
+
+[DSH Go](https://github.com/ccch1mneyyy/dsh-go) is a third-party DeepSeek Harness Android client that can run DSH on your phone or connect to your computer through this plugin.
 
 `ds-harness-remote` is the Remote Host and workspace plugin for DeepSeek Harness. Harness keeps running on your work computer with its existing workspaces, tools, and permission controls; Remote gives authorized devices another window into that environment.
 
@@ -18,9 +20,11 @@ For native Harness workspaces (`backend: "harness"`), the same Agent can use:
 
 | Tool | Purpose |
 | --- | --- |
+| `remote_list_presets` | List available agent presets on the Remote Host (`hostId`, `backend`, optional `workspaceId`). |
 | `remote_list_sessions` | List root sessions in an existing workspace; live catalog pagination. |
-| `remote_read_session` | Read bounded native history, with an older-page cursor and explicit truncation. |
-| `remote_create_session` | Create an empty session in the selected workspace. |
+| `remote_read_session` | Read bounded native history, `agentPreset` (when reported), with an older-page cursor and explicit truncation. |
+| `remote_create_session` | Create an empty session in the selected workspace, optionally composing a `preset` before the first turn. |
+| `remote_select_preset` | Select an agent preset for a blank session before its first turn starts. |
 | `remote_send_message` | Queue a text task or follow-up under existing Host permissions. |
 | `remote_wait_sessions` | Observe up to eight sessions, for up to 60 seconds; zero requests snapshots. |
 | `remote_interrupt_session` | Request interruption of the current execution; does not undo edits or delete queued messages. |
@@ -42,13 +46,13 @@ In DeepSeek Harness Desktop, open **Extensions / Plugin management**, choose ins
 from **npm**, and enter:
 
 ```text
-ds-harness-remote@0.6.4
+ds-harness-remote@0.6.5
 ```
 
 Restart Desktop after installation. Its official `dsh` launcher can also install the package:
 
 ```sh
-dsh plugin --profile desktop add -w ds-harness-remote@0.6.4
+dsh plugin --profile desktop add -w ds-harness-remote@0.6.5
 ```
 
 Use Desktop's official launcher to manage its reserved `desktop` profile.
@@ -58,7 +62,7 @@ Use Desktop's official launcher to manage its reserved `desktop` profile.
 Add the current package version to the `web` profile, then restart Harness:
 
 ```sh
-dsh plugin --profile web add -w ds-harness-remote@0.6.4
+dsh plugin --profile web add -w ds-harness-remote@0.6.5
 ```
 
 ## Highlights
@@ -96,7 +100,7 @@ This repository includes a minimal, single-account self-hosted Relay Server in [
 
 - [Complete guide](https://github.com/liguobao/ds-harness-remote#readme)
 - [Codex Remote technical notes](https://github.com/liguobao/ds-harness-remote/blob/main/docs/codex-remote.md)
-- [Agent workspace integration guide](https://github.com/liguobao/ds-harness-remote/blob/main/docs/acp-integration.md)
+- [Agent workspace integration guide](https://github.com/liguobao/ds-harness-remote/blob/main/docs/acp-remote.md)
 - [End-to-end encryption](https://github.com/liguobao/ds-harness-remote/blob/main/docs/end-to-end-encryption.md)
 - [Network and transport](https://github.com/liguobao/ds-harness-remote/blob/main/docs/network.md)
 - [Protocol reference](https://github.com/liguobao/ds-harness-remote/blob/main/docs/protocol.md)

@@ -8,7 +8,7 @@ import type { ResolvedConfig } from '../src/config.js'
 import type { HostIdentity, IdentityStore, TrustedPeer } from '../src/identity-store.js'
 import type { SafeLogger } from '../src/logging.js'
 import { ServerApiError, HostServerApi } from '../src/server-api.js'
-import { HostServerConnection } from '../src/server-connection.js'
+import { HostServerConnection, resolveWebRtcNegotiateTimeoutMs } from '../src/server-connection.js'
 import type { AuthenticatedPeerChannel } from '../src/types.js'
 import { PLUGIN_VERSION } from '../src/version.js'
 import { ServerCredentialStore } from '../src/server-credentials.js'
@@ -71,11 +71,23 @@ describe('HostServerConnection', () => {
     }
   })
 
-  it('keeps the responder alive for the Server RTC budget and preserves legacy defaults', async () => {
+  it('respects bounded Server RTC fallback hints and filters invalid or extreme values', async () => {
+    for (const invalid of [undefined, null, 0, -1, Number.NaN, Number.POSITIVE_INFINITY, 3000.5, '3000']) {
+      expect(resolveWebRtcNegotiateTimeoutMs(invalid)).toBe(12_000)
+    }
+    expect(resolveWebRtcNegotiateTimeoutMs(1)).toBe(2_000)
+    expect(resolveWebRtcNegotiateTimeoutMs(1_999)).toBe(2_000)
+    expect(resolveWebRtcNegotiateTimeoutMs(3_000)).toBe(3_000)
+    expect(resolveWebRtcNegotiateTimeoutMs(60_000)).toBe(60_000)
+    expect(resolveWebRtcNegotiateTimeoutMs(60_001)).toBe(60_000)
+
     await runScenarios([
-      { name: 'twenty-second Server', timeout: 20000, expected: 20000 },
-      { name: 'legacy Server without timeout', timeout: undefined, expected: 12000 },
-      { name: 'shorter Server budget preserves local minimum', timeout: 8000, expected: 12000 },
+      { name: 'twenty-second Server', timeout: 20_000, expected: 20_000 },
+      { name: 'legacy Server without timeout', timeout: undefined, expected: 12_000 },
+      { name: 'no-TURN Server short budget', timeout: 3_000, expected: 3_000 },
+      { name: 'eight-second Server budget', timeout: 8_000, expected: 8_000 },
+      { name: 'tiny Server budget clamped to minimum', timeout: 500, expected: 2_000 },
+      { name: 'excessive Server budget clamped to ceiling', timeout: 120_000, expected: 60_000 },
     ].map(row => ({ name: row.name, run: async () => {
       vi.useFakeTimers()
       const hostKeys = generateKeyPair(new Uint8Array(32).fill(51))
@@ -114,6 +126,72 @@ describe('HostServerConnection', () => {
         await vi.advanceTimersByTimeAsync(1)
         expect(pc.close).toHaveBeenCalledOnce()
         expect(socket.readyState).toBe(1)
+      } finally {
+        try {
+          await server.stop()
+          expect(vi.getTimerCount()).toBe(0)
+        } finally { vi.useRealTimers(); vi.restoreAllMocks() }
+      }
+    } })))
+  })
+
+  it('drops only the timed-out tunnel on late WebRTC transport.selected while still rejecting unoffered WebRTC', async () => {
+    await runScenarios([
+      { name: 'late WebRTC after responder fallback', sendOffer: true },
+      { name: 'unoffered WebRTC before data channel', sendOffer: false },
+    ].map(row => ({ name: row.name, run: async () => {
+      vi.useFakeTimers()
+      const hostKeys = generateKeyPair(new Uint8Array(32).fill(53))
+      const clientKeys = generateKeyPair(new Uint8Array(32).fill(54))
+      const peer = { deviceId: 'client-1', name: 'Client', platform: 'linux', publicKey: clientKeys.publicKey,
+        fingerprint: 'CLIENT', membershipId: 'member', trustedAt: 1 }
+      const socket = new FakeWebSocket()
+      const pc = { connectionState: 'new', iceConnectionState: 'new', iceGatheringState: 'new',
+        setRemoteDescription: async () => {}, createAnswer: async () => ({ type: 'answer', sdp: 'answer' }),
+        setLocalDescription: async () => {}, getStats: async () => [], close: vi.fn() }
+      const server = new HostServerConnection({ ...config(), forceRelay: false },
+        { schemaVersion: 1, deviceId: 'host-1', name: 'Host', fingerprint: 'HOST', ...hostKeys },
+        { trustedPeer: () => peer } as unknown as IdentityStore,
+        { baseUrl: 'https://remote.test', authenticate: async () => ({ accessToken: 'test-token' }),
+          deviceFor: async () => ({ ...peer, role: 'client', identityKey: clientKeys.publicKey }),
+          turnCredentials: async () => [],
+        } as unknown as HostServerApi,
+        { close: async () => {} } as unknown as ConnectionController, logger(), () => socket,
+        async () => ({ create: () => pc }) as unknown as RtcPeerConnectionFactory)
+      try {
+        server.start()
+        await vi.advanceTimersByTimeAsync(0)
+        socket.open()
+        socket.receive(createControlFrame('hello.ack', { ...helloAck('control-1'),
+          capabilities: ['transport.p2p', 'transport.relay'],
+          webrtcFallbackTimeoutMs: 3_000,
+        }))
+        socket.receive(createControlFrame('connect.incoming', { connectionId: 'connection-1',
+          clientDeviceId: 'client-1', clientIdentityKey: clientKeys.publicKey,
+          authorization: 'account', preferredTransports: ['p2p', 'relay'],
+        }))
+        if (row.sendOffer) {
+          socket.receive(createControlFrame('signal.offer', { connectionId: 'connection-1', targetDeviceId: 'host-1', sdp: 'offer' }))
+          await vi.advanceTimersByTimeAsync(3_000)
+          expect(pc.close).toHaveBeenCalledOnce()
+        } else {
+          await vi.advanceTimersByTimeAsync(0)
+        }
+        socket.receive(createControlFrame('transport.selected', {
+          connectionId: 'connection-1', targetDeviceId: 'host-1', transport: 'p2p',
+        }))
+        await vi.advanceTimersByTimeAsync(0)
+        if (row.sendOffer) {
+          expect(socket.readyState).toBe(1)
+          const errors = socket.sent.map(frame => JSON.parse(frame)).filter(frame => frame.type === 'error')
+          expect(errors.map(frame => frame.payload)).toContainEqual(expect.objectContaining({
+            code: 'CONNECTION_FAILED',
+            connectionId: 'connection-1',
+            retryable: true,
+          }))
+        } else {
+          expect(socket.readyState).toBe(3)
+        }
       } finally {
         try {
           await server.stop()
@@ -513,7 +591,11 @@ describe('HostServerConnection', () => {
   it('recovers control authentication only within the authorized retry budget', async () => {
     const rows = [
       'recover',
+      'recover-error-frame',
+      'recover-4001-token-expired',
+      'recover-after-heartbeat-timeout',
       'reject-again',
+      'reject-again-error-frame',
       'refresh-rejected',
       'revoked',
       'revoked-frame',
@@ -529,14 +611,16 @@ describe('HostServerConnection', () => {
           run: async () => {
             const keys = generateKeyPair(new Uint8Array(32).fill(24))
             const sockets: FakeWebSocket[] = []
+            let refreshed = false
             const api = {
               baseUrl: 'https://dsh.r2049.cn',
               authenticate: vi.fn(async () => ({
-                accessToken: sockets.length === 0 ? 'old-access-value' : 'new-access-value',
+                accessToken: refreshed ? 'new-access-value' : 'old-access-value',
               })),
               refreshCredentials: vi.fn(async () => {
                 if (scenario === 'refresh-rejected')
                   throw new ServerApiError('AUTH_INVALID', 'refresh rejected', false, 401, 'credential_refresh')
+                refreshed = true
               }),
               clearAuthorization: vi.fn(async () => undefined),
             } as unknown as HostServerApi
@@ -573,22 +657,83 @@ describe('HostServerConnection', () => {
                     retryable: false,
                   }),
                 )
+              } else if (scenario === 'recover-error-frame' || scenario === 'reject-again-error-frame') {
+                sockets[0]!.receive(
+                  createControlFrame('error', {
+                    code: 'AUTH_INVALID',
+                    message: 'invalid access token',
+                    retryable: false,
+                  }),
+                )
+              } else if (scenario === 'recover-4001-token-expired') {
+                sockets[0]!.receive(
+                  createControlFrame('error', {
+                    code: 'TOKEN_EXPIRED',
+                    message: 'TOKEN_EXPIRED',
+                    retryable: false,
+                  }),
+                )
+                sockets[0]!.close(4001, 'TOKEN_EXPIRED')
+              } else if (scenario === 'recover-after-heartbeat-timeout') {
+                sockets[0]!.receive(createControlFrame('hello.ack', helloAck('control-initial')))
+                await flush()
+                sockets[0]!.close(4009, 'heartbeat timeout')
+                await new Promise((resolve) => setTimeout(resolve, 15))
+                expect(sockets).toHaveLength(2)
+                sockets[1]!.open()
+                sockets[1]!.receive(
+                  createControlFrame('error', {
+                    code: 'AUTH_INVALID',
+                    message: 'invalid access token',
+                    retryable: false,
+                  }),
+                )
               } else {
                 sockets[0]!.close(scenario.startsWith('replaced') ? 4003 : scenario === 'revoked' ? 4004 : 4002)
               }
               await flush()
-              if (scenario === 'recover' || scenario === 'reject-again') {
+              if (scenario === 'recover-after-heartbeat-timeout') {
+                expect(sockets).toHaveLength(3)
+                expect(api.refreshCredentials).toHaveBeenCalledWith('old-access-value')
+                sockets[2]!.open()
+                expect(JSON.parse(sockets[2]!.sent[0]!).payload.accessToken).toBe('new-access-value')
+                sockets[2]!.receive(createControlFrame('hello.ack', helloAck('control-recovered-after-4009')))
+                await flush()
+                expect(server.isOnline()).toBe(true)
+                expect(server.lastError()).toBeUndefined()
+                expect(api.refreshCredentials).toHaveBeenCalledTimes(1)
+              } else if (
+                scenario === 'recover'
+                || scenario === 'recover-error-frame'
+                || scenario === 'recover-4001-token-expired'
+                || scenario === 'reject-again'
+                || scenario === 'reject-again-error-frame'
+              ) {
                 expect(sockets).toHaveLength(2)
                 expect(api.refreshCredentials).toHaveBeenCalledWith('old-access-value')
                 sockets[1]!.open()
                 expect(JSON.parse(sockets[1]!.sent[0]!).payload.accessToken).toBe('new-access-value')
-                if (scenario === 'recover') {
+                if (
+                  scenario === 'recover'
+                  || scenario === 'recover-error-frame'
+                  || scenario === 'recover-4001-token-expired'
+                ) {
                   sockets[1]!.receive(createControlFrame('hello.ack', helloAck('control-recovered')))
                   await flush()
                   expect(server.isOnline()).toBe(true)
                   expect(server.lastError()).toBeUndefined()
                 } else {
-                  sockets[1]!.close(4002)
+                  if (scenario === 'reject-again-error-frame') {
+                    sockets[1]!.receive(
+                      createControlFrame('error', {
+                        code: 'AUTH_INVALID',
+                        message: 'invalid access token',
+                        retryable: false,
+                      }),
+                    )
+                  } else {
+                    sockets[1]!.close(4002)
+                  }
                   await new Promise((resolve) => setTimeout(resolve, 20))
                   expect(sockets).toHaveLength(2)
                   expect(server.lastError()).toBe('AUTH_INVALID')
@@ -627,7 +772,7 @@ describe('HostServerConnection', () => {
   })
 
   it('recovers retryable refresh failures without spending the handshake retry', async () => {
-    const rows = ['RATE_LIMITED', 'CONNECTION_FAILED'] as const
+    const rows = ['RATE_LIMITED', 'CONNECTION_FAILED', 'SERVER_CREDENTIALS_BUSY'] as const
     await runScenarios(
       rows.map((row, index) => {
         const code = row
@@ -983,6 +1128,8 @@ describe('HostServerConnection', () => {
   })
 
   it('closes retained tunnels and stops retrying when the Server rejects the protocol version', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(1)
     const sockets: FakeWebSocket[] = []
     const rtc = { close: vi.fn(async () => undefined) }
     const channel = { close: vi.fn(async () => undefined) }
@@ -1001,23 +1148,32 @@ describe('HostServerConnection', () => {
     lease.acknowledge({ ...requests[0]!, ticket: 'confirmed', leaseMs: 300_000 })
     try {
       server.start()
-      await flush()
+      await vi.advanceTimersByTimeAsync(0)
       sockets[0]!.open()
       sockets[0]!.receive(createControlFrame('hello.ack', { ...helloAck('control-rtc'), capabilities: ['transport.p2p', 'transport.webrtc.resume.v1'] }))
-      await vi.waitFor(() => expect(server.isOnline()).toBe(true))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(server.isOnline()).toBe(true)
       const internals = server as unknown as { tunnels: Map<string, unknown> }
       internals.tunnels.set('connection-rtc', { connectionId: 'connection-rtc', transport: 'p2p', rtc, channel, lease })
       sockets[0]!.close(1012, 'Server restart')
-      await vi.waitFor(() => expect(sockets).toHaveLength(2))
+      // Exercise the maximum jitter delay without racing a wall-clock timeout.
+      await vi.advanceTimersByTimeAsync(cfg.reconnect.maxDelayMs - 1)
+      expect(sockets).toHaveLength(1)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(sockets).toHaveLength(2)
       sockets[1]!.open()
       sockets[1]!.close(4011, 'unsupported protocol version')
-      await vi.waitFor(() => expect(channel.close).toHaveBeenCalledOnce())
+      await vi.advanceTimersByTimeAsync(0)
+      expect(channel.close).toHaveBeenCalledOnce()
       expect(rtc.close).toHaveBeenCalledOnce()
       expect(internals.tunnels.size).toBe(0)
       expect(server.lastError()).toBe('UNSUPPORTED_VERSION')
-      await new Promise(resolve => setTimeout(resolve, 250))
+      await vi.advanceTimersByTimeAsync(cfg.reconnect.maxDelayMs * 2)
       expect(sockets).toHaveLength(2)
-    } finally { await server.stop(); lease.stop() }
+    } finally {
+      try { await server.stop(); lease.stop() }
+      finally { vi.useRealTimers(); vi.restoreAllMocks() }
+    }
   })
 
   it('keeps an authenticated Relay fallback when the parallel WebRTC negotiation later fails', async () => {
@@ -1261,6 +1417,7 @@ function helloAck(connectionSessionId: string) {
 function config(): ResolvedConfig {
   return {
     terminal: { enabled: false },
+    httpServerAllowlist: [],
     sidebar: { entry: 'standard' },
     loopback: { ports: [] },
     enabled: true,
@@ -1879,6 +2036,432 @@ it('stops sending remaining fragments when a relay tunnel is dropped mid-send', 
       accepted!.send(createRpcRequest('harness.api.call', { method: 'host.describe', rpcId: 'big-1', payload: { text: largePayload } })),
     ).rejects.toThrow(/Relay tunnel closed|Secure channel closed/)
     expect(relaySent).toBe(1)
+  } finally {
+    initiator.destroy()
+    await server.stop()
+  }
+})
+
+it('retires the old Relay data socket after WebRTC upgrade drain so idle close cannot drop the upgraded tunnel', async () => {
+  const hostKeys = generateKeyPair(new Uint8Array(32).fill(81))
+  const clientKeys = generateKeyPair(new Uint8Array(32).fill(82))
+  const identity: HostIdentity = {
+    schemaVersion: 1,
+    deviceId: 'host-upgrade-retire',
+    name: 'Host',
+    fingerprint: 'HOST',
+    ...hostKeys,
+  }
+  const peer: TrustedPeer = {
+    deviceId: 'client-upgrade-retire',
+    name: 'Phone',
+    platform: 'android',
+    publicKey: clientKeys.publicKey,
+    fingerprint: 'CLIENT',
+    trustedAt: 1,
+    membershipId: 'membership-upgrade-retire',
+  }
+  const control = new FakeWebSocket()
+  const dataSockets: FakeWebSocket[] = []
+  const createWebSocket = vi.fn((url: string) => {
+    if (url.endsWith('/ws/v1/connect')) return control
+    const ws = new FakeWebSocket()
+    dataSockets.push(ws)
+    return ws
+  })
+  let accepted: AuthenticatedPeerChannel | undefined
+  const closeConnection = vi.fn(async () => true)
+  const connections = {
+    accept: vi.fn(async (channel: AuthenticatedPeerChannel) => { accepted = channel }),
+    closeConnection,
+    close: vi.fn(async () => undefined),
+  } as unknown as ConnectionController
+  const api = {
+    baseUrl: 'https://dsh.r2049.cn',
+    authenticate: vi.fn(async () => ({ accessToken: 'access-token-value' })),
+    deviceFor: vi.fn(async () => ({
+      deviceId: peer.deviceId,
+      name: peer.name,
+      role: 'client',
+      platform: peer.platform,
+      identityKey: peer.publicKey,
+      membershipId: peer.membershipId!,
+    })),
+    turnCredentials: vi.fn(async () => []),
+  } as unknown as HostServerApi
+  const lanStats = new Map([
+    ['L1', { id: 'L1', type: 'local-candidate', candidateType: 'host', address: '192.168.1.10' }],
+    ['R1', { id: 'R1', type: 'remote-candidate', candidateType: 'host', address: '192.168.1.20' }],
+    ['P1', { id: 'P1', type: 'candidate-pair', localCandidateId: 'L1', remoteCandidateId: 'R1', state: 'succeeded', nominated: true }],
+    ['T1', { id: 'T1', type: 'transport', selectedCandidatePairId: 'P1' }],
+  ])
+  const rtcFactory: RtcPeerConnectionFactory = {
+    create() {
+      const dc = {
+        label: 'dsh', ordered: true, readyState: 'connecting' as 'connecting' | 'open' | 'closed',
+        bufferedAmount: 0, binaryType: 'arraybuffer',
+        onopen: null as (() => void) | null,
+        onmessage: null as ((event: { data: ArrayBuffer | string }) => void) | null,
+        onclose: null as (() => void) | null,
+        onerror: null as (() => void) | null,
+        onbufferedamountlow: null as (() => void) | null,
+        send: vi.fn(),
+        close() { this.readyState = 'closed'; this.onclose?.() },
+      }
+      const pc = {
+        connectionState: 'new', iceConnectionState: 'new', iceGatheringState: 'new', signalingState: 'stable',
+        onicecandidate: null,
+        ondatachannel: null as ((event: { channel: typeof dc }) => void) | null,
+        onconnectionstatechange: null, oniceconnectionstatechange: null, onicegatheringstatechange: null,
+        createDataChannel: () => dc,
+        createOffer: async () => ({ type: 'offer' as const, sdp: 'v=0\r\noffer' }),
+        createAnswer: async () => ({ type: 'answer' as const, sdp: 'v=0\r\nanswer' }),
+        setLocalDescription: async () => {
+          pc.ondatachannel?.({ channel: dc })
+          queueMicrotask(() => { dc.readyState = 'open'; dc.onopen?.() })
+        },
+        setRemoteDescription: async () => undefined,
+        addIceCandidate: async () => undefined,
+        getStats: async () => lanStats,
+        close: vi.fn(),
+      }
+      return pc as unknown as ReturnType<RtcPeerConnectionFactory['create']>
+    },
+  }
+  const server = new HostServerConnection(
+    { ...config(), forceRelay: false },
+    identity,
+    { trustedPeer: () => peer } as unknown as IdentityStore,
+    api,
+    connections,
+    logger(),
+    createWebSocket,
+    async () => rtcFactory,
+  )
+  const clientNoise = new NoiseIkSession({
+    role: 'initiator',
+    localPrivateKey: clientKeys.privateKey,
+    localPublicKey: clientKeys.publicKey,
+    remotePublicKey: hostKeys.publicKey,
+    prologue: createNoisePrologue('conn-retire-ds', identity.deviceId, peer.deviceId),
+  })
+  try {
+    server.start()
+    await flush()
+    control.open()
+    control.receive(createControlFrame('hello.ack', {
+      ...helloAck('control-retire'),
+      capabilities: ['transport.lan', 'transport.p2p', 'transport.relay', 'transport.relay.attach'],
+    }))
+    control.receive(createControlFrame('connect.incoming', {
+      connectionId: 'conn-retire-ds',
+      clientDeviceId: peer.deviceId,
+      clientIdentityKey: peer.publicKey,
+      authorization: 'account',
+      preferredTransports: ['lan', 'p2p', 'relay'],
+      relayEndpoint: 'wss://relay.example/ws',
+      relayTicket: 'dshrt.retire-ticket',
+      relayNodeId: 'relay-1',
+      relayEpoch: 1,
+    }))
+    await flush()
+    control.receive(createControlFrame('transport.selected', {
+      connectionId: 'conn-retire-ds',
+      targetDeviceId: identity.deviceId,
+      transport: 'relay',
+    }))
+    await flush()
+    expect(dataSockets).toHaveLength(1)
+    const oldDataSocket = dataSockets[0]!
+    oldDataSocket.open()
+    oldDataSocket.receive({ v: 1, id: 'r1', type: 'relay.ready', timestamp: Date.now(), payload: { connectionId: 'conn-retire-ds', epoch: 1 } })
+    await flush()
+    control.receive(createControlFrame('secure.handshake', {
+      connectionId: 'conn-retire-ds',
+      targetDeviceId: identity.deviceId,
+      step: 1,
+      data: toBase64Url(clientNoise.writeHandshake()),
+    }))
+    await flush()
+    const reply = JSON.parse(control.sent.find(raw => JSON.parse(raw).type === 'secure.handshake')!)
+    clientNoise.readHandshake(fromBase64UrlForTest(reply.payload.data))
+    expect(accepted?.mode).toBe('Relay')
+
+    const received: RemoteMessage[] = []
+    accepted!.onMessage(msg => received.push(msg))
+    const upgrader = accepted!.createTransportUpgradeHost!(async () => undefined)
+    if (upgrader === undefined) throw new Error('Expected TransportUpgradeHost')
+    await upgrader.offer({ attemptId: 'att-1', sdp: 'v=0\r\noffer' })
+    const activated = await upgrader.activate({ attemptId: 'att-1', transport: 'lan' })
+    expect(activated).toMatchObject({ activated: true, mode: 'LAN' })
+    expect(accepted!.mode).toBe('LAN')
+
+    // Trailing frame still in-flight on the old Relay dataSocket is delivered before drain completes.
+    const trailing = createRpcRequest('harness.transport.describe', {})
+    oldDataSocket.receive({
+      v: 1,
+      id: 'trail-0',
+      type: 'relay',
+      timestamp: Date.now(),
+      payload: {
+        connectionId: 'conn-retire-ds',
+        targetDeviceId: identity.deviceId,
+        counter: 0,
+        ciphertext: toBase64Url(clientNoise.encrypt(encodeMessage(trailing))),
+      },
+    })
+    await flush()
+    expect(received).toHaveLength(1)
+
+    // Confirming drain retires and closes the old Relay dataSocket without dropping the upgraded LAN tunnel.
+    await upgrader.drain({ attemptId: 'att-1', previousLegEndCounter: 1 })
+    expect(oldDataSocket.readyState).toBe(3)
+    expect(oldDataSocket.onmessage).toBeNull()
+    expect(oldDataSocket.onclose).toBeNull()
+    expect(oldDataSocket.onerror).toBeNull()
+    expect(closeConnection).not.toHaveBeenCalled()
+    expect((server as unknown as { tunnels: Map<string, unknown> }).tunnels.has('conn-retire-ds')).toBe(true)
+
+    await upgrader.closeAll()
+  } finally {
+    clientNoise.destroy()
+    await server.stop()
+  }
+})
+
+it('attaches the assigned Relay data socket and ControlLease when handleRtcFailed falls back before transport.selected', async () => {
+  const hostKeys = generateKeyPair(new Uint8Array(32).fill(83))
+  const clientKeys = generateKeyPair(new Uint8Array(32).fill(84))
+  const identity: HostIdentity = {
+    schemaVersion: 1,
+    deviceId: 'host-rtc-fallback',
+    name: 'Host',
+    fingerprint: 'HOST',
+    ...hostKeys,
+  }
+  const peer: TrustedPeer = {
+    deviceId: 'client-rtc-fallback',
+    name: 'Phone',
+    platform: 'android',
+    publicKey: clientKeys.publicKey,
+    fingerprint: 'CLIENT',
+    trustedAt: 1,
+    membershipId: 'membership-rtc-fallback',
+  }
+  const control = new FakeWebSocket()
+  const dataSockets: FakeWebSocket[] = []
+  const createWebSocket = vi.fn((url: string) => {
+    if (url.endsWith('/ws/v1/connect')) return control
+    const ws = new FakeWebSocket()
+    dataSockets.push(ws)
+    return ws
+  })
+  let accepted: AuthenticatedPeerChannel | undefined
+  const connections = {
+    accept: vi.fn(async (channel: AuthenticatedPeerChannel) => { accepted = channel }),
+    closeConnection: vi.fn(async () => true),
+    close: vi.fn(async () => undefined),
+  } as unknown as ConnectionController
+  const pc = {
+    connectionState: 'new', iceConnectionState: 'new', iceGatheringState: 'new', signalingState: 'stable',
+    onicecandidate: null, ondatachannel: null,
+    onconnectionstatechange: null as (() => void) | null,
+    oniceconnectionstatechange: null as (() => void) | null,
+    onicegatheringstatechange: null,
+    setRemoteDescription: async () => undefined,
+    createAnswer: async () => ({ type: 'answer' as const, sdp: 'v=0\r\nanswer' }),
+    setLocalDescription: async () => undefined,
+    addIceCandidate: async () => undefined,
+    getStats: async () => [],
+    close: vi.fn(),
+  }
+  const server = new HostServerConnection(
+    { ...config(), forceRelay: false },
+    identity,
+    { trustedPeer: () => peer } as unknown as IdentityStore,
+    {
+      baseUrl: 'https://dsh.r2049.cn',
+      authenticate: vi.fn(async () => ({ accessToken: 'access-token-value' })),
+      deviceFor: vi.fn(async () => ({
+        deviceId: peer.deviceId, name: peer.name, role: 'client', platform: peer.platform,
+        identityKey: peer.publicKey, membershipId: peer.membershipId!,
+      })),
+      turnCredentials: vi.fn(async () => []),
+    } as unknown as HostServerApi,
+    connections,
+    logger(),
+    createWebSocket,
+    async () => ({ create: () => pc }) as unknown as RtcPeerConnectionFactory,
+  )
+  const clientNoise = new NoiseIkSession({
+    role: 'initiator',
+    localPrivateKey: clientKeys.privateKey,
+    localPublicKey: clientKeys.publicKey,
+    remotePublicKey: hostKeys.publicKey,
+    prologue: createNoisePrologue('conn-rtc-fallback', identity.deviceId, peer.deviceId),
+  })
+  try {
+    server.start()
+    await flush()
+    control.open()
+    control.receive(createControlFrame('hello.ack', {
+      ...helloAck('control-fallback'),
+      capabilities: ['transport.p2p', 'transport.relay', 'transport.relay.attach', 'transport.relay.resume.v1'],
+    }))
+    control.receive(createControlFrame('connect.incoming', {
+      connectionId: 'conn-rtc-fallback',
+      clientDeviceId: peer.deviceId,
+      clientIdentityKey: peer.publicKey,
+      authorization: 'account',
+      preferredTransports: ['p2p', 'relay'],
+      relayEndpoint: 'wss://relay.example/ws',
+      relayTicket: 'dshrt.fallback-ticket',
+      relayNodeId: 'relay-1',
+      relayEpoch: 7,
+      relayRecoveryTicket: 'relay-lease-ticket',
+    }))
+    await flush()
+    control.receive(createControlFrame('signal.offer', {
+      connectionId: 'conn-rtc-fallback',
+      targetDeviceId: identity.deviceId,
+      sdp: 'v=0\r\noffer',
+    }))
+    await flush()
+    // Handshake step 1 arrives while still negotiating; must stay buffered until relay.ready.
+    control.receive(createControlFrame('secure.handshake', {
+      connectionId: 'conn-rtc-fallback',
+      targetDeviceId: identity.deviceId,
+      step: 1,
+      data: toBase64Url(clientNoise.writeHandshake()),
+    }))
+    await flush()
+    expect(accepted).toBeUndefined()
+
+    // WebRTC fails on Host BEFORE transport.selected(relay) arrives.
+    pc.iceConnectionState = 'failed'
+    pc.oniceconnectionstatechange?.()
+    await vi.waitFor(() => expect(dataSockets).toHaveLength(1))
+    expect(accepted).toBeUndefined()
+
+    // Concurrent transport.selected(relay) while relay.ready is pending must deduplicate and not open a second dataSocket.
+    control.receive(createControlFrame('transport.selected', {
+      connectionId: 'conn-rtc-fallback',
+      targetDeviceId: identity.deviceId,
+      transport: 'relay',
+    }))
+    await flush()
+    expect(dataSockets).toHaveLength(1)
+    expect(accepted).toBeUndefined()
+
+    const ds = dataSockets[0]!
+    ds.open()
+    expect(JSON.parse(ds.sent[0]!)).toMatchObject({
+      type: 'relay.attach',
+      payload: { connectionId: 'conn-rtc-fallback', ticket: 'dshrt.fallback-ticket' },
+    })
+    ds.receive({ v: 1, id: 'ready', type: 'relay.ready', timestamp: Date.now(), payload: { connectionId: 'conn-rtc-fallback', epoch: 7 } })
+    await vi.waitFor(() => expect(accepted).toBeDefined())
+
+    const leaseReq = control.sent.map(raw => JSON.parse(raw)).find(frame => frame.type === 'connection.lease.request')
+    expect(leaseReq?.payload).toMatchObject({ connectionId: 'conn-rtc-fallback', ticket: 'relay-lease-ticket' })
+
+    const reply = control.sent.map(raw => JSON.parse(raw)).find(frame => frame.type === 'secure.handshake')
+    clientNoise.readHandshake(fromBase64UrlForTest(reply.payload.data))
+    const msg = createRpcRequest('harness.transport.describe', {})
+    await accepted!.send(msg)
+    expect(ds.sent.map(raw => JSON.parse(raw)).filter(frame => frame.type === 'relay')).toHaveLength(1)
+    expect(control.sent.map(raw => JSON.parse(raw)).filter(frame => frame.type === 'relay')).toHaveLength(0)
+  } finally {
+    clientNoise.destroy()
+    await server.stop()
+  }
+})
+
+it('does not send connection.lease.request on a reconnecting Host socket before hello.ack', async () => {
+  const hostKeys = generateKeyPair(new Uint8Array(32).fill(85))
+  const clientKeys = generateKeyPair(new Uint8Array(32).fill(86))
+  const sockets: FakeWebSocket[] = []
+  const server = new HostServerConnection(
+    { ...config(), forceRelay: false, reconnect: { enabled: true, initialDelayMs: 5, maxDelayMs: 10, jitter: 0 } },
+    { schemaVersion: 1, deviceId: 'host-lease-gate', name: 'Host', fingerprint: 'HOST', ...hostKeys },
+    { trustedPeer: () => undefined } as unknown as IdentityStore,
+    { baseUrl: 'https://dsh.r2049.cn', authenticate: vi.fn(async () => ({ accessToken: 'access-token' })) } as unknown as HostServerApi,
+    { accept: vi.fn(async () => undefined), close: vi.fn(async () => undefined), closeConnection: vi.fn(async () => true) } as unknown as ConnectionController,
+    logger(),
+    () => { const ws = new FakeWebSocket(); sockets.push(ws); return ws },
+    async () => undefined,
+  )
+  const responder = new NoiseIkSession({
+    role: 'responder',
+    localPrivateKey: hostKeys.privateKey,
+    localPublicKey: hostKeys.publicKey,
+    remotePublicKey: clientKeys.publicKey,
+    prologue: createNoisePrologue('conn-lease-gate', 'host-lease-gate', 'client-lease-gate'),
+  })
+  const initiator = new NoiseIkSession({
+    role: 'initiator',
+    localPrivateKey: clientKeys.privateKey,
+    localPublicKey: clientKeys.publicKey,
+    remotePublicKey: hostKeys.publicKey,
+    prologue: createNoisePrologue('conn-lease-gate', 'host-lease-gate', 'client-lease-gate'),
+  })
+  try {
+    server.start()
+    await vi.waitFor(() => expect(sockets).toHaveLength(1))
+    sockets[0]!.open()
+    sockets[0]!.receive(createControlFrame('hello.ack', {
+      ...helloAck('control-gate-1'),
+      capabilities: ['transport.p2p', 'transport.webrtc.resume.v1'],
+    }))
+    await vi.waitFor(() => expect(server.isOnline()).toBe(true))
+    const internals = server as unknown as {
+      tunnels: Map<string, unknown>
+      completeHandshake(tunnel: unknown, payload: unknown): Promise<void>
+    }
+    const tunnel = {
+      connectionId: 'conn-lease-gate',
+      membershipId: 'mem-1',
+      peer: { deviceId: 'client-lease-gate', publicKey: clientKeys.publicKey },
+      noise: responder,
+      rtc: { send: vi.fn(async () => undefined), close: vi.fn(async () => undefined) },
+      transport: 'p2p',
+      recoveryTicket: 'initial-lease-ticket',
+    }
+    internals.tunnels.set('conn-lease-gate', tunnel)
+    await internals.completeHandshake(tunnel, {
+      connectionId: 'conn-lease-gate',
+      targetDeviceId: 'host-lease-gate',
+      step: 1,
+      data: toBase64Url(initiator.writeHandshake()),
+    })
+    const initialReq = sockets[0]!.sent.map(raw => JSON.parse(raw)).find(frame => frame.type === 'connection.lease.request')
+    expect(initialReq).toBeDefined()
+    sockets[0]!.receive(createControlFrame('connection.lease.ack', {
+      ...initialReq.payload,
+      ticket: 'confirmed-lease-ticket',
+      leaseMs: 300_000,
+    }))
+    await flush()
+
+    // Control drops and reconnects; the new socket opens and sends hello, but hello.ack has not arrived yet.
+    sockets[0]!.close(1012, 'restart')
+    await vi.waitFor(() => expect(sockets).toHaveLength(2))
+    sockets[1]!.open()
+    expect(server.isOnline()).toBe(false)
+    expect(sockets[1]!.sent.map(raw => JSON.parse(raw).type)).toEqual(['hello'])
+
+    // Even if ControlLease ticks while the new socket is open before hello.ack, it must NOT emit an unauthenticated frame.
+    ;(internals.tunnels.get('conn-lease-gate') as { lease?: ControlLease } | undefined)?.lease?.tick(true)
+    expect(sockets[1]!.sent.map(raw => JSON.parse(raw).type)).toEqual(['hello'])
+
+    // Once hello.ack arrives, the forced lease renewal fires immediately.
+    sockets[1]!.receive(createControlFrame('hello.ack', {
+      ...helloAck('control-gate-2'),
+      capabilities: ['transport.p2p', 'transport.webrtc.resume.v1'],
+    }))
+    await vi.waitFor(() => expect(server.isOnline()).toBe(true))
+    const renewedReq = sockets[1]!.sent.map(raw => JSON.parse(raw)).find(frame => frame.type === 'connection.lease.request')
+    expect(renewedReq?.payload).toMatchObject({ connectionId: 'conn-lease-gate', ticket: 'confirmed-lease-ticket' })
   } finally {
     initiator.destroy()
     await server.stop()

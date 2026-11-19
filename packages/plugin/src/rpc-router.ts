@@ -1,7 +1,15 @@
+import { DSH_WEB_CAPABILITY } from '@dsh-remote/protocol'
+import type { DshWebPeer } from './dsh-web-host.js'
+import type { LanUploadHost } from './lan-upload.js'
+import { TRANSPORT_UPGRADE_CAPABILITY, type TransportUpgradeHost } from './transport-upgrade.js'
 import {
+  BINARY_UPLOAD_CAPABILITY,
+  LAN_UPLOAD_CAPABILITY,
   createRpcError,
   createRpcResponse,
   parseRemoteWorkspaceTypes,
+  REMOTE_COMPACTION_CAPABILITY,
+  sessionTransferMethods,
   type RemoteMessage,
   type RemoteWorkspaceTypeDescription,
   type RpcErrorPayload,
@@ -14,17 +22,33 @@ import type { HarnessRemoteBridge } from './harness-remote-bridge.js'
 import type { SafeLogger } from './logging.js'
 import type { CodexPeerBridge } from './codex/peer-bridge.js'
 import type { AcpPeerBridge } from './acp/peer-bridge.js'
-import { RpcError, safeErrorCode } from './safe-error.js'
+import { RpcError, safeErrorCode, workspaceFileFailureReason } from './safe-error.js'
 import type { WorkspaceUploadHost } from './workspace-upload.js'
 import type { PluginRouteBridge } from './plugin-route-bridge.js'
+import type { RemoteCompactionOperations, RemoteCompactionOwner } from './remote-compaction-operations.js'
+
+import type { SessionTransferPeer } from './session-transfer.js'
 
 export { RpcError } from './safe-error.js'
 
 const wireRequestSchema = z.object({ method: z.string().min(1), params: z.unknown() }).strict()
 const emptyParamsSchema = z.object({}).strict()
 const historyConfigureSchema = z.object({ compact: z.boolean() }).strict()
+const compactionSessionSchema = z.string().min(1).max(128)
+const compactionSubmitSchema = z.object({
+  sessionId: compactionSessionSchema,
+  requestId: z.string().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/),
+  budgetMs: z.number().int().min(60_000).max(7_200_000).optional(),
+}).strict()
+const compactionOperationSchema = z.object({
+  sessionId: compactionSessionSchema,
+  operationId: z.string().uuid(),
+}).strict()
 const apiMethods = new Set([
+  ...sessionTransferMethods,
   'harness.transport.describe',
+  'dsh.web.open',
+  'dsh.web.close',
   'remote.history.configure',
   'harness.remote.call',
   'harness.remote.transfer.open',
@@ -34,6 +58,9 @@ const apiMethods = new Set([
   'harness.remote.transfer.close',
   'harness.remote.stream.open',
   'harness.remote.stream.close',
+  'harness.remote.compaction.submit',
+  'harness.remote.compaction.status',
+  'harness.remote.compaction.cancel',
   'loopback.call',
   'fileviewer.call',
   'codex.app.call',
@@ -55,10 +82,17 @@ const apiMethods = new Set([
   'agent.acp.transfer.read',
   'agent.acp.transfer.close',
   'plugin.route.call',
+  'workspace.upload.lan.open',
   'workspace.upload.open',
   'workspace.upload.chunk',
+  'workspace.upload.chunk.binary',
   'workspace.upload.commit',
   'workspace.upload.abort',
+  'remote.transport.upgrade.offer',
+  'remote.transport.upgrade.ice',
+  'remote.transport.upgrade.activate',
+  'remote.transport.upgrade.drain',
+  'remote.transport.upgrade.abort',
 ])
 
 export const HOST_CAPABILITIES = [
@@ -72,6 +106,12 @@ export const HOST_CAPABILITIES = [
   'agent.acp.transfer.v1',
 ] as const
 
+/** Per-connection view of the Host-wide async compaction registry. */
+export interface RemoteCompactionRoute {
+  operations: RemoteCompactionOperations
+  owner: RemoteCompactionOwner
+}
+
 export class RpcRouter {
   private active = 0
 
@@ -80,22 +120,31 @@ export class RpcRouter {
     private readonly logger?: SafeLogger,
     private readonly fileViewer?: RemoteFileViewerBridge,
     private readonly harnessRemote?: HarnessRemoteBridge,
-    private readonly capabilities: () => readonly string[] = () => HOST_CAPABILITIES,
+    private readonly capabilities: () => readonly string[] | Promise<readonly string[]> = () => HOST_CAPABILITIES,
     private readonly codex?: CodexPeerBridge,
     private readonly acp?: AcpPeerBridge,
     private readonly loopback?: LoopbackHost,
     private readonly workspaceTypes?: () => readonly RemoteWorkspaceTypeDescription[],
     private readonly pluginRoute?: PluginRouteBridge,
     private readonly workspaceUpload?: WorkspaceUploadHost,
+    private readonly compaction?: RemoteCompactionRoute,
+    private readonly lanUpload?: LanUploadHost,
+    private readonly transportUpgrade?: TransportUpgradeHost,
+    private readonly sessionTransfer?: SessionTransferPeer,
+    private readonly dshWeb?: DshWebPeer,
   ) {}
 
   async closePeerStreams(): Promise<void> {
     this.loopback?.closeAll()
+    this.sessionTransfer?.close()
     await Promise.all([
       this.harnessRemote?.closeAll(),
       this.codex?.closeAll(),
       this.acp?.closeAll(),
       this.workspaceUpload?.closeAll(),
+      this.lanUpload?.closeAll(),
+      this.transportUpgrade?.closeAll(),
+      this.dshWeb?.dispose(),
     ])
   }
 
@@ -116,7 +165,7 @@ export class RpcRouter {
     const startedAt = performance.now()
     try {
       const result = await this.invoke(request.payload.method, request.payload.params)
-      const subMethod = typeof (request.payload.params as Record<string, unknown> | undefined)?.method === 'string'
+      const subMethod = !request.payload.method.startsWith('session.transfer.') && typeof (request.payload.params as Record<string, unknown> | undefined)?.method === 'string'
         ? String((request.payload.params as Record<string, unknown>).method)
         : undefined
       this.logger?.info('host rpc ok', {
@@ -128,15 +177,18 @@ export class RpcRouter {
     } catch (error: unknown) {
       const response = errorResponse(request.id, error)
       const failedEndpoint = !request.payload.method.startsWith('workspace.upload.')
+        && !request.payload.method.startsWith('session.transfer.')
         && typeof (request.payload.params as Record<string, unknown> | undefined)?.endpoint === 'string'
         ? String((request.payload.params as Record<string, unknown>).endpoint)
         : undefined
+      const reason = workspaceFileFailureReason(error)
       this.logger?.warn('host rpc failed', {
         method: request.payload.method,
         ...(failedEndpoint ? { endpoint: failedEndpoint } : {}),
         durationMs: Math.round(performance.now() - startedAt),
         code: response.payload.code,
         retryable: response.payload.retryable,
+        ...(reason === undefined ? {} : { reason }),
       })
       return response
     } finally {
@@ -144,12 +196,27 @@ export class RpcRouter {
     }
   }
 
-  private invoke(method: string, params: unknown): Promise<unknown> | unknown {
+  private async invoke(method: string, params: unknown): Promise<unknown> {
     switch (method) {
+      case 'dsh.web.open':
+        emptyParamsSchema.parse(params)
+        if (!this.dshWeb) throw new RpcError('FEATURE_NOT_SUPPORTED', 'DSH Web is unavailable.')
+        return this.dshWeb.open()
+      case 'dsh.web.close':
+        emptyParamsSchema.parse(params)
+        await this.dshWeb?.close()
+        return { closed: true }
       case 'harness.transport.describe': {
         emptyParamsSchema.parse(params)
-        const capabilities = [...new Set([...this.capabilities(), 'remote.history.compact.v1',
-          ...(this.harnessRemote === undefined ? [] : ['harness.remote.stream.transfer.v1']),
+        const hostCapabilities = (await this.capabilities()).filter(capability => capability !== BINARY_UPLOAD_CAPABILITY && capability !== LAN_UPLOAD_CAPABILITY)
+        const remoteAvailable = hostCapabilities.includes('harness.remote.v1') || hostCapabilities.includes('harness.remote.v3')
+        const capabilities = [...new Set([...hostCapabilities, 'remote.history.compact.v1',
+          ...(this.harnessRemote === undefined || !remoteAvailable ? [] : ['harness.remote.stream.transfer.v1']),
+          ...(this.compaction === undefined ? [] : [REMOTE_COMPACTION_CAPABILITY]),
+          ...(this.workspaceUpload === undefined || !hostCapabilities.includes('workspace.upload.v1') ? [] : [BINARY_UPLOAD_CAPABILITY, ...(this.lanUpload ? [LAN_UPLOAD_CAPABILITY] : [])]),
+          ...(this.sessionTransfer?.capabilities() ?? []),
+          ...(this.dshWeb?.available() ? [DSH_WEB_CAPABILITY] : []),
+          ...(this.transportUpgrade === undefined ? [] : [TRANSPORT_UPGRADE_CAPABILITY]),
         ])]
         let workspaceTypes: RemoteWorkspaceTypeDescription[] | undefined
         if (this.workspaceTypes !== undefined) {
@@ -170,6 +237,18 @@ export class RpcRouter {
           if (bridge !== undefined) bridge.compactHistoryEnabled = compact
         }
         return { compact }
+      }
+      case 'harness.remote.compaction.submit': {
+        const route = this.requireCompaction()
+        return route.operations.submit(compactionSubmitSchema.parse(params), route.owner)
+      }
+      case 'harness.remote.compaction.status': {
+        const route = this.requireCompaction()
+        return route.operations.status(compactionOperationSchema.parse(params), route.owner)
+      }
+      case 'harness.remote.compaction.cancel': {
+        const route = this.requireCompaction()
+        return route.operations.cancel(compactionOperationSchema.parse(params), route.owner)
       }
       case 'harness.remote.call': return this.requireRemoteGateway().call(params)
       case 'harness.remote.transfer.open': return this.requireRemoteGateway().openTransfer(params)
@@ -207,16 +286,38 @@ export class RpcRouter {
       case 'agent.acp.transfer.commit': return this.requireAcp().commitTransfer(params)
       case 'agent.acp.transfer.read': return this.requireAcp().readTransfer(params)
       case 'agent.acp.transfer.close': return this.requireAcp().closeTransfer(params)
+      case 'workspace.upload.lan.open': {
+        if (!this.lanUpload) throw new RpcError('FEATURE_NOT_SUPPORTED', 'LAN upload is unavailable on this Host.')
+        return this.lanUpload.open(params)
+      }
       case 'workspace.upload.open':
       case 'workspace.upload.chunk':
+      case 'workspace.upload.chunk.binary':
       case 'workspace.upload.commit':
       case 'workspace.upload.abort': {
         if (!this.workspaceUpload) throw new RpcError('FEATURE_NOT_SUPPORTED', 'Workspace upload is unavailable on this Host.')
         return this.workspaceUpload.call(method, params)
       }
       case 'plugin.route.call': return this.requirePluginRoute().call(params)
-      default: throw new RpcError('METHOD_NOT_FOUND', 'The requested method does not exist.')
+      case 'remote.transport.upgrade.offer': return this.requireTransportUpgrade().offer(params)
+      case 'remote.transport.upgrade.ice': return this.requireTransportUpgrade().addIce(params)
+      case 'remote.transport.upgrade.activate': return this.requireTransportUpgrade().activate(params)
+      case 'remote.transport.upgrade.drain': return this.requireTransportUpgrade().drain(params)
+      case 'remote.transport.upgrade.abort': return this.requireTransportUpgrade().abort(params)
+      default:
+        if (method.startsWith('session.transfer.')) {
+          if (!this.sessionTransfer) throw new RpcError('FEATURE_NOT_SUPPORTED', 'Session transfer is unavailable on this Host.')
+          return this.sessionTransfer.call(method, params)
+        }
+        throw new RpcError('METHOD_NOT_FOUND', 'The requested method does not exist.')
     }
+  }
+
+  private requireCompaction(): RemoteCompactionRoute {
+    if (this.compaction === undefined) {
+      throw new RpcError('FEATURE_NOT_SUPPORTED', 'This Host does not provide asynchronous Remote compaction.')
+    }
+    return this.compaction
   }
 
   private requireRemoteGateway(): HarnessRemoteBridge {
@@ -245,6 +346,13 @@ export class RpcRouter {
       throw new RpcError('FEATURE_NOT_SUPPORTED', 'This Host cannot forward local plugin routes.')
     }
     return this.pluginRoute
+  }
+
+  private requireTransportUpgrade(): TransportUpgradeHost {
+    if (this.transportUpgrade === undefined) {
+      throw new RpcError('CAPABILITY_NOT_SUPPORTED', 'In-band transport upgrade is unavailable on this Host.')
+    }
+    return this.transportUpgrade
   }
 }
 

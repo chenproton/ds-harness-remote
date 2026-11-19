@@ -36,9 +36,9 @@ export interface ClientControlContext {
   readonly openRemoteWorkspace: (targetDeviceId: string, path: string, signal?: AbortSignal) => Promise<Record<string, unknown>>
   readonly openCodexWorkspace: (targetDeviceId: string, workspaceId: string, signal?: AbortSignal) => Promise<Record<string, unknown>>
   readonly createCodexWorkspace: (targetDeviceId: string, path: string, signal?: AbortSignal) => Promise<Record<string, unknown>>
-  readonly listCursorWorkspaces: (targetDeviceId: string, signal?: AbortSignal, backend?: "cursor" | "antigravity" | "pi" | "opencode" | "claude" | "hermes") => Promise<AcpVirtualWorkspaceView[]>
-  readonly openCursorWorkspace: (targetDeviceId: string, workspaceId: string, signal?: AbortSignal, backend?: "cursor" | "antigravity" | "pi" | "opencode" | "claude" | "hermes") => Promise<Record<string, unknown>>
-  readonly createCursorWorkspace: (targetDeviceId: string, path: string, signal?: AbortSignal, backend?: "cursor" | "antigravity" | "pi" | "opencode" | "claude" | "hermes") => Promise<Record<string, unknown>>
+  readonly listCursorWorkspaces: (targetDeviceId: string, signal?: AbortSignal, backend?: string) => Promise<AcpVirtualWorkspaceView[]>
+  readonly openCursorWorkspace: (targetDeviceId: string, workspaceId: string, signal?: AbortSignal, backend?: string) => Promise<Record<string, unknown>>
+  readonly createCursorWorkspace: (targetDeviceId: string, path: string, signal?: AbortSignal, backend?: string) => Promise<Record<string, unknown>>
   readonly consumeWorkspaceSelection: (selection: RemoteWorkspaceSelection) => Record<string, unknown>
   readonly callRemoteFileViewer: (endpoint: RemoteFileViewerEndpoint, payload: unknown, signal?: AbortSignal) => Promise<unknown>
   readonly activeCodexRemote: () => ConnectedRemote | undefined
@@ -246,6 +246,49 @@ export class ClientControl {
         }
         return ok(await this.context.createCursorWorkspace(value.targetDeviceId, value.path, signal, 'hermes'))
       }
+      if (endpoint === 'acp.workspaces.list') {
+        const value = record(payload)
+        if (typeof value.targetDeviceId !== 'string' || typeof value.backend !== 'string' || value.backend.trim() === '') {
+          throw new ClientModeError('INVALID_MESSAGE', 'A Host and ACP backend are required.')
+        }
+        return ok(await this.context.listCursorWorkspaces(value.targetDeviceId, signal, value.backend.trim()))
+      }
+      if (endpoint === 'acp.workspace.open') {
+        const value = record(payload)
+        if (typeof value.targetDeviceId !== 'string' || typeof value.workspaceId !== 'string' || typeof value.backend !== 'string' || value.backend.trim() === '') {
+          throw new ClientModeError('INVALID_MESSAGE', 'A Host, ACP backend, and Workspace are required.')
+        }
+        return ok(await this.context.openCursorWorkspace(value.targetDeviceId, value.workspaceId, signal, value.backend.trim()))
+      }
+      if (endpoint === 'acp.workspace.create') {
+        const value = record(payload)
+        if (typeof value.targetDeviceId !== 'string' || typeof value.path !== 'string' || typeof value.backend !== 'string' || value.backend.trim() === '') {
+          throw new ClientModeError('INVALID_MESSAGE', 'A Host, ACP backend, and project directory are required.')
+        }
+        return ok(await this.context.createCursorWorkspace(value.targetDeviceId, value.path, signal, value.backend.trim()))
+      }
+      const dynamicListMatch = /^([a-z0-9][a-z0-9_-]{0,31})\.workspaces\.list$/.exec(endpoint)
+      if (dynamicListMatch !== null) {
+        const value = record(payload)
+        if (typeof value.targetDeviceId !== 'string') throw new ClientModeError('INVALID_MESSAGE', 'A Host is required.')
+        return ok(await this.context.listCursorWorkspaces(value.targetDeviceId, signal, dynamicListMatch[1]!))
+      }
+      const dynamicOpenMatch = /^([a-z0-9][a-z0-9_-]{0,31})\.workspace\.open$/.exec(endpoint)
+      if (dynamicOpenMatch !== null) {
+        const value = record(payload)
+        if (typeof value.targetDeviceId !== 'string' || typeof value.workspaceId !== 'string') {
+          throw new ClientModeError('INVALID_MESSAGE', `A Host and ${dynamicOpenMatch[1]} Workspace are required.`)
+        }
+        return ok(await this.context.openCursorWorkspace(value.targetDeviceId, value.workspaceId, signal, dynamicOpenMatch[1]!))
+      }
+      const dynamicCreateMatch = /^([a-z0-9][a-z0-9_-]{0,31})\.workspace\.create$/.exec(endpoint)
+      if (dynamicCreateMatch !== null) {
+        const value = record(payload)
+        if (typeof value.targetDeviceId !== 'string' || typeof value.path !== 'string') {
+          throw new ClientModeError('INVALID_MESSAGE', `A Host and ${dynamicCreateMatch[1]} project directory are required.`)
+        }
+        return ok(await this.context.createCursorWorkspace(value.targetDeviceId, value.path, signal, dynamicCreateMatch[1]!))
+      }
       if (endpoint === 'workspace.selection.consume') {
         const value = record(payload)
         if (typeof value.targetDeviceId !== 'string' || typeof value.workspaceId !== 'string') {
@@ -299,6 +342,10 @@ export class ClientControl {
         const value = record(payload)
         if (typeof value.route !== 'string' || !isAllowedPluginRoute(value.route)) {
           throw new ClientModeError('INVALID_MESSAGE', 'A valid plugin route is required.')
+        }
+        if (value.route === 'api/session/uploadFileBinary'
+          && (typeof value.targetDeviceId !== 'string' || this.context.activeRemote()?.target.deviceId !== value.targetDeviceId)) {
+          throw new ClientModeError('REMOTE_NOT_CONNECTED', 'The selected upload Host changed. Select the file again.')
         }
         if (!isRecord(value.body)) throw new ClientModeError('INVALID_MESSAGE', 'A plugin route body object is required.')
         return ok(await this.context.pluginRoute(value.route, value.body, signal))

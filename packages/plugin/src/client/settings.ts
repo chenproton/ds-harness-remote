@@ -20,6 +20,8 @@ import type {
   OAuthQrPollResult,
   OAuthQrSession,
   PluginAssociation,
+  PluginLogFilter,
+  PluginLogView,
   PluginConfigureResult,
   PluginSettingsView,
   RemoteStatus,
@@ -33,6 +35,18 @@ const sidebarEntryChoices: ReadonlyArray<{ value: SidebarEntryStyle; label: 'sid
   { value: 'standard', label: 'sidebarEntryStandard' },
   { value: 'compact', label: 'sidebarEntryCompact' },
 ]
+
+const BUILTIN_ACP_LABELS: Record<string, string> = {
+  codex: 'CodeX',
+  cursor: 'Cursor',
+  antigravity: 'AGY',
+  claude: 'Claude',
+  pi: 'Pi',
+  opencode: 'OpenCode',
+  hermes: 'Hermes',
+}
+
+const BUILTIN_ACP_SCAN_ONLY = new Set(['cursor', 'antigravity', 'hermes'])
 
 export function createRemotePluginOptions(React: ClientReact) {
   const ServerNotice = createServerNotice(React)
@@ -70,15 +84,32 @@ export function createRemotePluginOptions(React: ClientReact) {
     const [terminalEnabled, setTerminalEnabled] = React.useState(false)
     const [debugBusy, setDebugBusy] = React.useState(false)
     const [debugLogging, setDebugLogging] = React.useState(false)
+    const [logsOpen, setLogsOpen] = React.useState(false)
+    const [logsFilter, setLogsFilter] = React.useState<PluginLogFilter>('all')
+    const [logsLoading, setLogsLoading] = React.useState(false)
+    const [logsClearing, setLogsClearing] = React.useState(false)
+    const [logsSnapshot, setLogsSnapshot] = React.useState<PluginLogView | undefined>(undefined)
+    const [logsError, setLogsError] = React.useState<string | undefined>(undefined)
+    const [logsCopyState, setLogsCopyState] = React.useState<'idle' | 'copied' | 'failed'>('idle')
+    const logsRequestRun = React.useRef(0)
+    const logsCopyTimer = React.useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+    const logsViewportRef = React.useRef<{ scrollTop: number; scrollHeight: number } | null>(null)
     const [resetBusy, setResetBusy] = React.useState(false)
+    const [retryStartupBusy, setRetryStartupBusy] = React.useState(false)
     const [terminalBusy, setTerminalBusy] = React.useState(false)
     const [sidebarEntry, setSidebarEntry] = React.useState<SidebarEntryStyle>(() => props.sidebarEntry?.read?.() ?? 'standard')
     const [sidebarEntryBusy, setSidebarEntryBusy] = React.useState(false)
     const [acpBackends, setAcpBackends] = React.useState<Array<{ id: string; enabled: boolean }>>([])
     const [acpAvailability, setAcpAvailability] = React.useState<Record<string, boolean>>({})
+    const [acpDiagnostics, setAcpDiagnostics] = React.useState<PluginSettingsView['acpDiagnostics']>({})
     const [acpChecking, setAcpChecking] = React.useState<Record<string, boolean>>({})
     const [acpInstalling, setAcpInstalling] = React.useState<Record<string, boolean>>({})
     const [acpCheckResults, setAcpCheckResults] = React.useState<Record<string, boolean | undefined>>({})
+    const [newAcpId, setNewAcpId] = React.useState('')
+    const [newAcpCommand, setNewAcpCommand] = React.useState('')
+    const [newAcpArgs, setNewAcpArgs] = React.useState('acp')
+    const [addingAcp, setAddingAcp] = React.useState(false)
+    const [addAcpFormOpen, setAddAcpFormOpen] = React.useState(false)
     const [reconnectBusy, setReconnectBusy] = React.useState(false)
     const [hostStatus, setHostStatus] = React.useState<RemoteStatus['host'] | undefined>(undefined)
     const [hostName, setHostName] = React.useState('')
@@ -95,7 +126,7 @@ export function createRemotePluginOptions(React: ClientReact) {
     const [oauthProviders, setOAuthProviders] = React.useState<OAuthProviderInfo[]>([])
     const [providersLoading, setProvidersLoading] = React.useState(false)
     const [providersFailed, setProvidersFailed] = React.useState(false)
-    const [pairingAvailable, setPairingAvailable] = React.useState(false)
+    const [pairingServerUrl, setPairingServerUrl] = React.useState<string | undefined>(undefined)
     const [qrSession, setQrSession] = React.useState<OAuthQrSession | undefined>(undefined)
     const [qrImage, setQrImage] = React.useState<string | undefined>(undefined)
     const [qrExpired, setQrExpired] = React.useState(false)
@@ -107,14 +138,17 @@ export function createRemotePluginOptions(React: ClientReact) {
     const qrFlowRun = React.useRef(0)
     const providerRequestRun = React.useRef(0)
     const loginMethodManuallySelected = React.useRef(false)
-    const selectedLoginMethod = React.useRef(loginMethod)
-    selectedLoginMethod.current = loginMethod
 
     const associationReadRun = React.useRef(0)
     const association = associations.client ?? associations.host
     React.useEffect(() => { if (association !== undefined) setSignInOpen(false) }, [association])
     const savedServerUrl = settingsView?.config.serverUrl
+    const pairingAvailable = pairingServerUrl !== undefined && pairingServerUrl === savedServerUrl
     const serverDirty = savedServerUrl === undefined || serverUrl.trim() !== savedServerUrl
+    React.useEffect(() => {
+      setPairingServerUrl(undefined)
+      setLoginMethod(current => current === 'device_pairing' ? 'password' : current)
+    }, [savedServerUrl])
 
     const applyAssociations = (view: PluginSettingsView): void => {
       setAssociations(view.associations ?? (view.association === undefined ? {} : { host: view.association }))
@@ -130,6 +164,7 @@ export function createRemotePluginOptions(React: ClientReact) {
       props.sidebarEntry?.publish(view.config.sidebar?.entry ?? 'standard')
       setAcpBackends((view.config.acp?.backends ?? []).map(item => ({ id: item.id, enabled: item.enabled !== false })))
       setAcpAvailability(view.acpAvailability ?? {})
+      setAcpDiagnostics(view.acpDiagnostics ?? {})
       if (updateAssociations) applyAssociations(view)
       setWritable(view.writable)
       setLoaded(true)
@@ -185,13 +220,12 @@ export function createRemotePluginOptions(React: ClientReact) {
       setQrBusy(false)
       setQrCompleted(false)
       setOAuthProviders([])
-      setPairingAvailable(false)
       setProvidersLoading(true)
       setProvidersFailed(false)
       void props.control<OAuthProviderInfo[]>('client.account.providers').then(items => {
         if (!active || run !== providerRequestRun.current) return
         const pairingSupported = items.some(item => item.devicePairing === true)
-        setPairingAvailable(pairingSupported)
+        setPairingServerUrl(pairingSupported ? savedServerUrl : undefined)
         const available = items.filter(item => item.qrStartUrl != null)
         setOAuthProviders(available)
         setLoginMethod(current => {
@@ -200,12 +234,10 @@ export function createRemotePluginOptions(React: ClientReact) {
           const preferred = available.find(item => item.id === props.preferredQrProvider) ?? available[0]
           return preferred === undefined ? 'password' : `oauth:${preferred.id}`
         })
-      }).catch(reason => {
+      }).catch(() => {
         if (!active || run !== providerRequestRun.current) return
         setProvidersFailed(true)
-        setPairingAvailable(false)
-        setLoginMethod('password')
-        if (selectedLoginMethod.current !== 'device_pairing') setError(messageOf(reason, t))
+        setLoginMethod(current => loginMethodManuallySelected.current && current === 'device_pairing' ? current : 'password')
       }).finally(() => {
         if (active && run === providerRequestRun.current) setProvidersLoading(false)
       })
@@ -512,6 +544,28 @@ export function createRemotePluginOptions(React: ClientReact) {
       }
     }
 
+    const addCustomAcp = async (): Promise<void> => {
+      const id = newAcpId.trim().toLowerCase()
+      const command = newAcpCommand.trim()
+      const args = newAcpArgs.trim() ? newAcpArgs.trim().split(/\s+/) : []
+      if (!id || !command || addingAcp) return
+      setAddingAcp(true)
+      setError(undefined)
+      try {
+        const view = await props.control<PluginSettingsView>('settings.acp.add', { id, command, args, enabled: true })
+        applyView(view)
+        setNewAcpId('')
+        setNewAcpCommand('')
+        setNewAcpArgs('acp')
+        setAddAcpFormOpen(false)
+        setNotice({ key: 'acpAddedNotice' })
+      } catch (reason) {
+        setError(messageOf(reason, t))
+      } finally {
+        setAddingAcp(false)
+      }
+    }
+
     const installOrConfigureAcp = async (backend: string): Promise<void> => {
       if (acpInstalling[backend]) return
       setAcpInstalling(current => ({ ...current, [backend]: true }))
@@ -537,26 +591,206 @@ export function createRemotePluginOptions(React: ClientReact) {
       }
     }
 
+    const loadLogs = async (filter: PluginLogFilter = logsFilter): Promise<void> => {
+      const run = ++logsRequestRun.current
+      setLogsLoading(true)
+      setLogsError(undefined)
+      try {
+        const next = await props.control<PluginLogView>('settings.logs.get', { filter, limit: 500 })
+        if (run !== logsRequestRun.current) return
+        setLogsSnapshot(next)
+      } catch (reason) {
+        if (run !== logsRequestRun.current) return
+        setLogsError(messageOf(reason, t))
+      } finally {
+        if (run === logsRequestRun.current) setLogsLoading(false)
+      }
+    }
+
+    const toggleLogsDrawer = (): void => {
+      const nextOpen = !logsOpen
+      setLogsOpen(nextOpen)
+      if (nextOpen) void loadLogs(logsFilter)
+    }
+
+    const changeLogsFilter = (filter: PluginLogFilter): void => {
+      if (filter === logsFilter && logsSnapshot !== undefined) return
+      setLogsFilter(filter)
+      void loadLogs(filter)
+    }
+
+    const copyLogs = async (): Promise<void> => {
+      const lines = logsSnapshot?.entries.map(entry => entry.line).join('\n') ?? ''
+      if (!lines) return
+      try {
+        if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+          await navigator.clipboard.writeText(lines)
+          setLogsCopyState('copied')
+        } else {
+          setLogsCopyState('failed')
+        }
+      } catch {
+        setLogsCopyState('failed')
+      }
+      if (logsCopyTimer.current !== undefined) clearTimeout(logsCopyTimer.current)
+      logsCopyTimer.current = setTimeout(() => {
+        logsCopyTimer.current = undefined
+        setLogsCopyState('idle')
+      }, 2000)
+    }
+
+    const exportLogs = (): void => {
+      const lines = logsSnapshot?.entries.map(entry => entry.line).join('\n') ?? ''
+      if (!lines || typeof document === 'undefined' || typeof Blob === 'undefined' || typeof URL === 'undefined') return
+      const blob = new Blob([lines + '\n'], { type: 'text/plain;charset=utf-8' })
+      const href = URL.createObjectURL(blob)
+      try {
+        const link = document.createElement('a')
+        link.href = href
+        link.download = 'ds-harness-remote-' + new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19) + '.log'
+        document.body?.appendChild(link)
+        link.click()
+        link.remove()
+      } finally {
+        URL.revokeObjectURL(href)
+      }
+    }
+
+    const clearLogs = async (): Promise<void> => {
+      if (logsClearing) return
+      const run = ++logsRequestRun.current
+      setLogsLoading(false)
+      setLogsClearing(true)
+      setLogsError(undefined)
+      try {
+        const cleared = await props.control<PluginLogView>('settings.logs.clear', {})
+        if (run !== logsRequestRun.current) return
+        setLogsSnapshot(cleared)
+      } catch (reason) {
+        if (run !== logsRequestRun.current) return
+        setLogsError(messageOf(reason, t))
+      } finally {
+        setLogsClearing(false)
+      }
+    }
+
+    React.useEffect(() => () => {
+      if (logsCopyTimer.current !== undefined) clearTimeout(logsCopyTimer.current)
+    }, [])
+
+    React.useEffect(() => {
+      if (!logsOpen) return
+      const viewport = logsViewportRef.current
+      if (viewport && typeof viewport.scrollHeight === 'number') {
+        viewport.scrollTop = viewport.scrollHeight
+      }
+    }, [logsOpen, logsSnapshot])
+
     const setDebug = async (enabled: boolean): Promise<void> => {
       if (debugBusy) return
       setDebugBusy(true)
       setError(undefined)
       try {
         applyView(await props.control<PluginSettingsView>('settings.development.set', { debugLogging: enabled }))
+        if (logsOpen) void loadLogs(logsFilter)
       } catch (reason) { setError(messageOf(reason, t)) }
       finally { setDebugBusy(false) }
     }
 
     const developmentSetting = React.createElement('section', { className: 'dshRemoteDevelopmentSettings' },
-      React.createElement('div', { className: 'dshRemoteAuthorizationSetting' },
-        React.createElement('div', null,
-          React.createElement('strong', null, t('debugLogging')),
-          React.createElement('p', null, t('debugLoggingHint'))),
-        React.createElement('input', {
-          type: 'checkbox', role: 'switch', checked: debugLogging,
-          disabled: busy || debugBusy || !writable, 'aria-label': t('debugLogging'),
-          onChange: (event: Event) => void setDebug((event.target as HTMLInputElement).checked),
-        })),
+      React.createElement('div', { className: 'dshRemoteDebugLogGroup' },
+        React.createElement('div', { className: 'dshRemoteDebugLogHeader' },
+          React.createElement('button', {
+            type: 'button',
+            className: 'dshRemoteDebugLogTrigger',
+            'aria-expanded': logsOpen,
+            onClick: toggleLogsDrawer,
+          },
+            React.createElement('span', { className: 'dshRemoteDebugLogTitleRow' },
+              React.createElement('strong', null, t('debugLogging')),
+              React.createElement('span', {
+                className: debugLogging ? 'dshRemoteDebugLogLevelBadge isDebug' : 'dshRemoteDebugLogLevelBadge',
+              }, debugLogging ? t('debugLoggingLevelDebug') : t('debugLoggingLevelInfo'))),
+            React.createElement('p', null, t('debugLoggingHint'))),
+          React.createElement('div', { className: 'dshRemoteDebugLogControls' },
+            React.createElement('button', {
+              type: 'button',
+              className: 'dshRemoteLogToggleBtn',
+              'aria-expanded': logsOpen,
+              onClick: toggleLogsDrawer,
+            },
+              React.createElement('span', null, logsOpen ? t('debugLogsToggleClose') : t('debugLogsToggleOpen')),
+              React.createElement('svg', {
+                className: 'dshRemoteLogToggleChevron',
+                viewBox: '0 0 16 16', width: 14, height: 14, fill: 'none',
+                stroke: 'currentColor', strokeWidth: 1.75, strokeLinecap: 'round', strokeLinejoin: 'round',
+                'aria-hidden': true,
+              }, React.createElement('path', { d: 'M4 6l4 4 4-4' }))),
+            React.createElement('input', {
+              type: 'checkbox', role: 'switch', checked: debugLogging,
+              disabled: busy || debugBusy || !writable, 'aria-label': t('debugLogging'),
+              onChange: (event: Event) => void setDebug((event.target as HTMLInputElement).checked),
+            }))),
+        logsOpen && React.createElement('div', { className: 'dshRemoteLogDrawer', role: 'region', 'aria-label': t('debugLogging') },
+          React.createElement('div', { className: 'dshRemoteLogToolbar' },
+            React.createElement('div', { className: 'dshRemoteLogFilterGroup', role: 'group' },
+              React.createElement('button', {
+                type: 'button',
+                className: logsFilter === 'all' ? 'dshRemoteLogFilterBtn isActive' : 'dshRemoteLogFilterBtn',
+                'aria-pressed': logsFilter === 'all',
+                onClick: () => changeLogsFilter('all'),
+              }, t('debugLogsFilterAll')),
+              React.createElement('button', {
+                type: 'button',
+                className: logsFilter === 'warn' ? 'dshRemoteLogFilterBtn isActive' : 'dshRemoteLogFilterBtn',
+                'aria-pressed': logsFilter === 'warn',
+                onClick: () => changeLogsFilter('warn'),
+              }, t('debugLogsFilterWarn'))),
+            React.createElement('div', { className: 'dshRemoteLogActions' },
+              React.createElement('button', {
+                type: 'button',
+                className: 'dshRemoteLogActionBtn',
+                disabled: logsLoading,
+                onClick: () => void loadLogs(logsFilter),
+              }, logsLoading ? t('debugLogsRefreshing') : t('debugLogsRefresh')),
+              React.createElement('button', {
+                type: 'button',
+                className: 'dshRemoteLogActionBtn',
+                disabled: !logsSnapshot?.entries.length,
+                onClick: () => void copyLogs(),
+              }, logsCopyState === 'copied' ? t('debugLogsCopied') : logsCopyState === 'failed' ? t('debugLogsCopyFailed') : t('debugLogsCopy')),
+              React.createElement('button', {
+                type: 'button',
+                className: 'dshRemoteLogActionBtn',
+                disabled: !logsSnapshot?.entries.length,
+                onClick: exportLogs,
+              }, t('debugLogsExport')),
+              React.createElement('button', {
+                type: 'button',
+                className: 'dshRemoteLogActionBtn',
+                disabled: logsClearing || !logsSnapshot?.totalBuffered,
+                onClick: () => void clearLogs(),
+              }, t('debugLogsClear')))),
+          (logsSnapshot?.filePath || logsSnapshot?.fileError || logsSnapshot) && React.createElement('div', { className: 'dshRemoteLogMeta' },
+            logsSnapshot?.filePath && React.createElement('span', null, t('debugLogsFileLabel'), ' ', React.createElement('code', null, logsSnapshot.filePath)),
+            logsSnapshot?.fileError && React.createElement('span', { className: 'dshRemoteLogFallback' }, t('debugLogsFileFallback', { error: logsSnapshot.fileError })),
+            logsSnapshot && React.createElement('span', null, t('debugLogsCount', { count: logsSnapshot.entries.length }))),
+          logsError && React.createElement('p', { className: 'dshRemoteError', role: 'alert' }, logsError),
+          logsLoading && !logsSnapshot
+            ? React.createElement('p', { className: 'dshRemoteLogEmpty' }, t('debugLogsLoading'))
+            : !logsSnapshot || logsSnapshot.entries.length === 0
+              ? React.createElement('p', { className: 'dshRemoteLogEmpty' }, t('debugLogsEmpty'))
+              : React.createElement('div', { className: 'dshRemoteLogViewport', ref: logsViewportRef },
+                  logsSnapshot.entries.map(entry => React.createElement('span', {
+                    key: entry.seq,
+                    className: entry.level === 'error'
+                      ? 'dshRemoteLogLine isError'
+                      : entry.level === 'warn'
+                        ? 'dshRemoteLogLine isWarn'
+                        : entry.level === 'debug'
+                          ? 'dshRemoteLogLine isDebug'
+                          : 'dshRemoteLogLine',
+                  }, entry.line))))),
       React.createElement('div', { className: 'dshRemoteAuthorizationSetting' },
         React.createElement('div', null,
           React.createElement('strong', null, t('terminalRemote')),
@@ -609,6 +843,28 @@ export function createRemotePluginOptions(React: ClientReact) {
     const resetDisabledByStartupState = settingsView?.startupError?.code === 'STORAGE_CONFLICT'
       || settingsView?.startupError?.code === 'IDENTITY_LOCKED'
 
+    const retryStartup = async (): Promise<void> => {
+      if (retryStartupBusy) return
+      const run = ++associationReadRun.current
+      setRetryStartupBusy(true)
+      setError(undefined)
+      setNotice(undefined)
+      try {
+        const view = await props.control<PluginSettingsView>('settings.startup.retry', {})
+        const status = await props.control<RemoteStatus>('status').catch(() => undefined)
+        applyView(view, run === associationReadRun.current)
+        setHostStatus(status?.host)
+        setHostName(status?.deviceName ?? '')
+        setHostDeviceId(status?.host?.deviceId ?? '')
+        setNotice({ key: 'retryStartupSuccess' })
+      } catch (reason) {
+        setError(messageOf(reason, t))
+        void load().catch(() => undefined)
+      } finally {
+        setRetryStartupBusy(false)
+      }
+    }
+
     const resetIdentitySetting = React.createElement('div', { className: 'dshRemoteAuthorizationSetting' },
       React.createElement('div', null,
         React.createElement('strong', null, t('resetIdentity')),
@@ -622,8 +878,14 @@ export function createRemotePluginOptions(React: ClientReact) {
     )
 
     const startupErrorBanner = settingsView?.startupError !== undefined
-      ? React.createElement('p', { className: 'dshRemoteError', role: 'alert' },
-          startupErrorMessage(settingsView.startupError, t))
+      ? React.createElement('div', { className: 'dshRemoteError', role: 'alert' },
+          React.createElement('p', null, startupErrorMessage(settingsView.startupError, t)),
+          React.createElement('button', {
+            type: 'button',
+            className: 'dshRemoteDiscard',
+            disabled: busy || resetBusy || retryStartupBusy,
+            onClick: () => void retryStartup(),
+          }, t('retryStartup')))
       : null
 
     // switches instead of inside the Host-facing settings block.
@@ -645,36 +907,132 @@ export function createRemotePluginOptions(React: ClientReact) {
         onClick: () => void setSidebarEntryStyle(choice.value),
       }, t(choice.label)))))
 
+    const acpEnabledCount = settingsView?.config.acp?.enabled === true
+      ? acpBackends.filter(item => item.enabled && acpAvailability[item.id] === true).length
+      : 0
+    const acpSummaryCount = acpBackends.length > 0 ? `${acpEnabledCount}/${acpBackends.length}` : undefined
+    const acpDocEndPunctuation = t('acpHint').includes('，') ? '。' : '.'
+
     const acpSetting = React.createElement('details', { className: 'dshRemoteAuthorizationSetting dshRemoteAcpSetting' },
       React.createElement('summary', null,
         React.createElement('div', { className: 'dshRemoteAcpSummaryText' },
           React.createElement('strong', null, t('agentBackends')),
-          React.createElement('p', null, t('acpHint'), React.createElement('a', {
-            href: 'https://github.com/liguobao/ds-harness-remote/blob/feat/cursor-remote/docs/acp-remote.md',
-            target: '_blank', rel: 'noopener noreferrer',
-            onClick: (event: Event) => event.stopPropagation(),
-          }, t('acpDocumentation'))))),
-      React.createElement('div', { className: 'dshRemoteAcpList' }, acpBackends.map(item => React.createElement('div', { key: item.id, className: 'dshRemoteAuthorizationSetting' },
-        React.createElement('div', null, React.createElement('strong', null, item.id === 'codex' ? 'CodeX' : item.id === 'cursor' ? 'Cursor' : item.id === 'antigravity' ? 'AGY' : item.id === 'claude' ? 'Claude' : item.id === 'pi' ? 'Pi' : item.id === 'opencode' ? 'OpenCode' : item.id === 'hermes' ? 'Hermes' : item.id), null),
-        React.createElement('span', { className: 'dshRemoteAcpCheckCell' },
-          // One entry per backend: while the command is unresolved this slot is
-          // the fix (scan / install), once it resolves it turns back into the
-          // read-only availability check. Keeping both visible at once made the
-          // row read as two competing actions.
-          writable && !busy && acpAvailability[item.id] !== true && ['codex', 'cursor', 'antigravity', 'pi', 'claude', 'opencode', 'hermes'].includes(item.id)
-            ? React.createElement('a', {
-              href: `#install-acp-${item.id}`,
-              className: `dshRemoteAcpInstallLink${acpInstalling[item.id] ? ' isInstalling' : ''}`,
-              onClick: (event: Event) => { event.preventDefault(); void installOrConfigureAcp(item.id) },
-            }, acpInstalling[item.id] ? t('installingAcp') : (['cursor', 'antigravity', 'hermes'].includes(item.id) ? t('configureAcp') : t('installAcp')))
-            : React.createElement('a', { href: `#check-acp-${item.id}`, className: `dshRemoteAcpCheckLink${acpChecking[item.id] ? ' isChecking' : acpCheckResults[item.id] === undefined ? '' : acpCheckResults[item.id] ? ' isPassed' : ' isFailed'}`, onClick: (event: Event) => { event.preventDefault(); void checkAcp(item.id) } },
-              acpChecking[item.id] ? t('checkingAcp') : acpCheckResults[item.id] === undefined ? t('checkAcp') : t(acpCheckResults[item.id] ? 'acpCheckPassed' : 'acpCheckFailed'))),
-        ['codex', 'cursor', 'antigravity', 'pi', 'claude', 'opencode', 'hermes'].includes(item.id) ? null : React.createElement('a', { href: `#remove-acp-${item.id}`, className: 'dshRemoteAcpRemoveLink', onClick: (event: Event) => { event.preventDefault(); void removeAcp(item.id) } }, t('removeAcp')),
-        React.createElement('input', {
-          type: 'checkbox', role: 'switch', checked: settingsView?.config.acp?.enabled === true && item.enabled && acpAvailability[item.id] === true, 'aria-label': item.id, disabled: busy || !writable || acpChecking[item.id] === true || acpAvailability[item.id] !== true,
-          onChange: (event: Event) => void props.control<PluginSettingsView>('settings.acp.set', { backend: item.id, enabled: (event.target as HTMLInputElement).checked }).then(view => { applyView(view); setAcpBackends((view.config.acp?.backends ?? []).map(v => ({ id: v.id, enabled: v.enabled !== false }))) }).catch(reason => setError(messageOf(reason, t)))
-        }))),
-        ))
+          React.createElement('p', null,
+            t('acpHint'),
+            React.createElement('a', {
+              className: 'dshRemoteDocLink',
+              href: 'https://github.com/liguobao/ds-harness-remote/blob/main/docs/acp-remote.md',
+              target: '_blank', rel: 'noopener noreferrer',
+              onClick: (event: Event) => event.stopPropagation(),
+            }, t('acpDocumentation')),
+            acpDocEndPunctuation)),
+        React.createElement('span', { className: 'dshRemoteAcpSummaryMeta' },
+          acpSummaryCount === undefined ? null : React.createElement('span', { className: 'dshRemoteAcpCountText' }, acpSummaryCount),
+          React.createElement('span', { className: 'dshRemoteAcpChevron', 'aria-hidden': true },
+            React.createElement('svg', {
+              viewBox: '0 0 16 16', width: 16, height: 16, fill: 'none',
+              stroke: 'currentColor', strokeWidth: 1.75, strokeLinecap: 'round', strokeLinejoin: 'round',
+            }, React.createElement('path', { d: 'M4 6l4 4 4-4' }))))),
+      acpBackends.length === 0 ? null : React.createElement('div', { className: 'dshRemoteAcpList' }, acpBackends.map(item => {
+        const diag = acpDiagnostics?.[item.id]
+        const isBuiltin = Object.prototype.hasOwnProperty.call(BUILTIN_ACP_LABELS, item.id)
+        const displayName = BUILTIN_ACP_LABELS[item.id] ?? item.id
+        const available = acpAvailability[item.id] === true
+        const checking = acpChecking[item.id] === true
+        const installing = acpInstalling[item.id] === true
+        const checkResult = acpCheckResults[item.id]
+        const showConfigure = writable && !busy && !available && isBuiltin
+        const statusMeta = checking
+          ? { cls: ' isChecking', label: t('checkingAcp') }
+          : checkResult !== undefined
+            ? { cls: checkResult ? ' isPassed' : ' isFailed', label: t(checkResult ? 'acpCheckPassed' : 'acpCheckFailed') }
+            : undefined
+        const diagDetail = diag && (diag.auth.authStatus === 'auth_required' || diag.state === 'unavailable')
+          ? [
+              diag.auth.authStatus === 'auth_required' ? `${t('acpAuthRequired')}: ` : '',
+              diag.auth.guidance ?? diag.errorCode ?? '',
+              diag.auth.loginCommand ? ` · ${t('acpLoginCommand', { command: diag.auth.loginCommand })}` : '',
+            ].join('').replace(/^ · /, '').trim()
+          : ''
+        return React.createElement('div', { key: item.id, className: 'dshRemoteAcpRow' },
+          React.createElement('div', { className: 'dshRemoteAcpRowMain' },
+            React.createElement('div', { className: 'dshRemoteAcpRowInfo' },
+              React.createElement('strong', { className: 'dshRemoteAcpName' }, displayName),
+              statusMeta === undefined ? null : React.createElement('span', { className: `dshRemoteAcpStatus${statusMeta.cls}` }, statusMeta.label)),
+            React.createElement('div', { className: 'dshRemoteAcpRowActions' },
+              isBuiltin ? null : React.createElement('button', {
+                type: 'button',
+                className: 'dshRemoteAcpRemoveBtn',
+                disabled: busy || !writable,
+                onClick: () => void removeAcp(item.id),
+              }, t('removeAcp')),
+              showConfigure
+                ? React.createElement('button', {
+                  type: 'button',
+                  className: `dshRemoteAcpActionBtn isConfigure${installing ? ' isInstalling' : ''}`,
+                  disabled: installing,
+                  onClick: () => void installOrConfigureAcp(item.id),
+                }, installing ? t('installingAcp') : (BUILTIN_ACP_SCAN_ONLY.has(item.id) ? t('configureAcp') : t('installAcp')))
+                : React.createElement('button', {
+                  type: 'button',
+                  className: `dshRemoteAcpActionBtn${checking ? ' isChecking' : ''}`,
+                  disabled: checking,
+                  onClick: () => void checkAcp(item.id),
+                }, checking ? t('checkingAcp') : t('checkAcp'))),
+            React.createElement('input', {
+              type: 'checkbox', role: 'switch', className: 'dshRemoteSwitch',
+              checked: settingsView?.config.acp?.enabled === true && item.enabled && available,
+              'aria-label': item.id,
+              disabled: busy || !writable || checking || !available,
+              onChange: (event: Event) => void props.control<PluginSettingsView>('settings.acp.set', { backend: item.id, enabled: (event.target as HTMLInputElement).checked }).then(view => { applyView(view); setAcpBackends((view.config.acp?.backends ?? []).map(v => ({ id: v.id, enabled: v.enabled !== false }))) }).catch(reason => setError(messageOf(reason, t))),
+            })),
+          diagDetail === '' ? null : React.createElement('p', { className: 'dshRemoteAcpDiag', role: 'status' }, diagDetail))
+      })),
+      !writable ? null : !addAcpFormOpen
+        ? React.createElement('button', {
+          type: 'button',
+          className: 'dshRemoteAcpAddTrigger',
+          disabled: busy,
+          onClick: () => setAddAcpFormOpen(true),
+        }, `+ ${t('addCustomAcp')}`)
+        : React.createElement('div', { className: 'dshRemoteAcpAddForm' },
+          React.createElement('div', { className: 'dshRemoteAcpAddInputs' },
+            React.createElement('input', {
+              type: 'text',
+              placeholder: t('acpIdHint'),
+              'aria-label': t('acpName'),
+              disabled: busy || addingAcp,
+              value: newAcpId,
+              onChange: (event: Event) => setNewAcpId((event.target as HTMLInputElement).value),
+            }),
+            React.createElement('input', {
+              type: 'text',
+              placeholder: t('acpCommand'),
+              'aria-label': t('acpCommand'),
+              disabled: busy || addingAcp,
+              value: newAcpCommand,
+              onChange: (event: Event) => setNewAcpCommand((event.target as HTMLInputElement).value),
+            }),
+            React.createElement('input', {
+              type: 'text',
+              placeholder: t('acpArguments'),
+              'aria-label': t('acpArguments'),
+              disabled: busy || addingAcp,
+              value: newAcpArgs,
+              onChange: (event: Event) => setNewAcpArgs((event.target as HTMLInputElement).value),
+            }),
+            React.createElement('button', {
+              type: 'button',
+              disabled: busy || addingAcp || newAcpId.trim() === '' || newAcpCommand.trim() === '',
+              onClick: () => void addCustomAcp(),
+            }, t('addAcp')),
+            React.createElement('button', {
+              type: 'button',
+              className: 'isGhost',
+              disabled: addingAcp,
+              onClick: () => setAddAcpFormOpen(false),
+            }, t('cancelServiceAddressEdit')))),
+        )
 
     if (props.view === 'summary') return React.createElement('span', null, t('pluginDescription'))
 
@@ -683,7 +1041,7 @@ export function createRemotePluginOptions(React: ClientReact) {
     const selectedProvider = oauthProviders.find(item => `oauth:${item.id}` === loginMethod)
     const scanLabel = t('scanWithProvider', { provider: selectedProvider?.displayName ?? '' })
     const passwordVisible = !savingServer && !serverDirty && loginMethod === 'password' && (
-      loginMethodManuallySelected.current || (!providersLoading && !providersFailed && oauthProviders.length === 0)
+      loginMethodManuallySelected.current || (!providersLoading && oauthProviders.length === 0)
     )
 
     const qrLoginTab = (provider: OAuthProviderInfo): unknown => React.createElement('button', {
@@ -714,6 +1072,11 @@ export function createRemotePluginOptions(React: ClientReact) {
         }, t('accountPasswordLogin'))),
       React.createElement('div', { className: 'dshRemoteLoginContent' },
       providersLoading && loginMethod !== 'device_pairing' ? React.createElement('p', { className: 'dshRemoteSettingsState', role: 'status' }, t('loadingLoginProviders')) : null,
+      providersFailed ? React.createElement('p', { className: 'dshRemoteSettingsState', role: 'status' },
+        t('noLoginProviders'), ' ', React.createElement('button', {
+          type: 'button', disabled: busy || savingServer || serverDirty,
+          onClick: () => setProviderReload(value => value + 1),
+        }, t('retryLoginProviders'))) : null,
       loginMethod === 'device_pairing' && pairingAvailable
         ? React.createElement('div', { role: 'tabpanel', id: 'dsh-remote-settings-device-pairing-panel', 'aria-labelledby': 'dsh-remote-settings-device-pairing-tab' },
           React.createElement(HostPairingPanel, { key: settingsView?.config.serverUrl ?? '', control: props.control, serverUrl: settingsView?.config.serverUrl ?? '', disabled: busy || !writable || serverDirty, t, onComplete: () => void props.control<PluginSettingsView>('settings.get').then(view => { applyView(view); setSignInOpen(false); props.onSignIn?.() }).catch(() => undefined) }))
@@ -742,7 +1105,9 @@ export function createRemotePluginOptions(React: ClientReact) {
           },
             qrCompleted
               ? React.createElement('div', { className: 'dshRemoteInlineSignInQrState' },
-                React.createElement('p', null, t('loadingSettings')),
+                React.createElement('div', { className: 'dshRemoteLoginProgress', role: 'status', 'aria-live': 'polite' },
+                  React.createElement('span', { className: 'dshRemoteLoginSpinner', 'aria-hidden': true }),
+                  t('loginLoadingSettings')),
                 React.createElement('button', {
                   type: 'button', className: 'dshRemoteReconnect', disabled: busy,
                   onClick: () => {
@@ -790,7 +1155,11 @@ export function createRemotePluginOptions(React: ClientReact) {
                       React.createElement('span', null, t('openInBrowser'), ' ↗'))
                     : null,
             React.createElement('strong', null, scanLabel),
-            React.createElement('p', null, t('scanLoginHint')))
+            React.createElement('p', null, t('scanLoginHint')),
+            !qrCompleted && !qrFailed && !qrExpired && (qrBusy || qrSession !== undefined)
+              ? React.createElement('div', { className: 'dshRemoteLoginProgress', role: 'status', 'aria-live': 'polite' },
+                React.createElement('span', { className: 'dshRemoteLoginSpinner', 'aria-hidden': true }),
+                t('loginWaitingAuthorization')) : null)
           : null,
       ),
               React.createElement('div', { className: 'dshRemoteServiceAddress' },

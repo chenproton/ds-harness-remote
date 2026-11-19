@@ -10,7 +10,7 @@ import { request as httpRequest } from 'node:http'
 import { WebSocket } from 'ws'
 import { MAX_CONTROL_FRAME_BYTES, createControlFrame } from '@dsh-remote/protocol'
 import { NoiseIkSession, createNoisePrologue, generateKeyPair, toBase64Url, fromBase64Url } from '../../../packages/crypto/src/index.js'
-import { RelayTransport } from '../../../packages/webrtc/src/index.js'
+import { AdaptiveTransport, RelayTransport, stunOnlyIceServers } from '../../../packages/webrtc/src/index.js'
 import { ClientSecureTransport } from '../../../packages/plugin/src/client-secure-transport.js'
 import { ClientServerApi } from '../../../packages/plugin/src/server-api.js'
 import { IdentityStore } from '../../../packages/plugin/src/identity-store.js'
@@ -45,6 +45,14 @@ async function request(path: string, method = 'GET', body?: unknown, token?: str
   const response = await fetch(`${base}/api/v1${path}`, { method, headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) })
   return { status: response.status, data: await response.json(), headers: response.headers }
 }
+async function rawJsonRequest(path: string, body: string | Uint8Array, token?: string) {
+  const response = await fetch(`${base}/api/v1${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+    body,
+  })
+  return { status: response.status, data: await response.json() }
+}
 async function start(pass = password, trustedProxyIps: readonly string[] = [], configOverrides: Partial<Config> = {}) {
   // Default to a STUN deployment so WebRTC tests exercise the ICE-assisted
   // path; tests override `ice` explicitly to cover the Relay-only boundary.
@@ -53,14 +61,14 @@ async function start(pass = password, trustedProxyIps: readonly string[] = [], c
   base = `http://127.0.0.1:${(app.server.address() as { port: number }).port}`
 }
 /** Send a raw HTTP/1.1 request so duplicate header lines stay separate (fetch merges them). */
-async function rawStatus(headerLines: string[]): Promise<number> {
+async function rawStatus(headerLines: string[], path = '/api/v1/auth/me'): Promise<number> {
   const port = (app.server.address() as { port: number }).port
   const crlf = String.fromCharCode(13, 10)
   const lines = [
-    'GET /api/v1/auth/me HTTP/1.1',
+    `GET ${path} HTTP/1.1`,
     `Host: 127.0.0.1:${port}`,
     ...headerLines,
-    'Connection: close',
+    `Connection: ${path === '/ws/v1/connect' ? 'Upgrade' : 'close'}`,
     '',
     '',
   ]
@@ -113,7 +121,7 @@ async function connection(options: { hostCapabilities?: string[]; clientCapabili
   const host = await socket(h, options.hostCapabilities === undefined ? {} : { capabilities: options.hostCapabilities })
   const client = await socket(c, options.clientCapabilities === undefined ? {} : { capabilities: options.clientCapabilities })
   const ack = await host.next('hello.ack')
-  expect(ack).toMatchObject({ webrtcEnabled: true })
+  expect(ack).toMatchObject({ webrtcEnabled: (options.hostCapabilities ?? fullCapabilities).some(capability => capability === 'transport.lan' || capability === 'transport.p2p') })
   expect(ack.capabilities).toEqual(expect.arrayContaining(['transport.relay']))
   await client.next('hello.ack')
   client.send('connect.request', { hostDeviceId: h.deviceId, preferredTransports: options.preferredTransports ?? ['relay'] })
@@ -183,6 +191,39 @@ const cleanupScenario2 = async () => {
 afterEach(cleanupScenario2)
 
 describe('account and device authorization', () => {
+  it('rejects duplicate REST fields before authentication or state changes', async () => {
+    const d = await device()
+    const registration = JSON.stringify({ v: 1, device: {
+      deviceId: randomUUID(), identityKey: generateKeyPair().publicKey,
+      name: 'new-device', role: 'client', platform: 'linux', clientVersion: '0.6.4',
+    } })
+    const cases = [
+      { path: '/auth/login', body: JSON.stringify({ email: account, password }).replace('"password":', '"password":"wrong","password":') },
+      { path: '/auth/login', body: JSON.stringify({ email: account, password }).replace('"password":', '"pass\\u0077ord":"wrong","password":') },
+      { path: '/devices/register', body: registration.replace('"identityKey":', '"identityKey":"wrong","identityKey":'), token: accountToken },
+      { path: '/auth/refresh', body: JSON.stringify({ deviceId: d.deviceId, refreshToken: d.refreshToken }).replace('"refreshToken":', '"refreshToken":"wrong","refreshToken":') },
+      { path: `/devices/${d.deviceId}/name`, body: '{"name":"first","name":"second"}', token: accountToken },
+      { path: '/auth/login', body: Uint8Array.from([0xc0, 0xaf]) },
+    ]
+    for (const entry of cases) {
+      const result = await rawJsonRequest(entry.path, entry.body, entry.token)
+      expect(result.status).toBe(400)
+      expect(result.data.error.code).toBe('INVALID_MESSAGE')
+    }
+    const devices = await request('/account/devices', 'GET', undefined, accountToken)
+    expect(devices.data.items).toHaveLength(1)
+    expect(devices.data.items[0].name).toBe('test-device')
+  })
+  it('rejects a noncanonical registered X25519 public key', async () => {
+    const keys = generateKeyPair()
+    const descriptor = {
+      deviceId: randomUUID(), identityKey: `${keys.publicKey.slice(0, -1)}B`,
+      name: 'invalid-key', role: 'client', platform: 'linux', clientVersion: '0.6.4',
+    }
+    const result = await request('/devices/register', 'POST', { v: 1, device: descriptor }, accountToken)
+    expect(result.status).toBe(400)
+    expect(result.data.error.code).toBe('INVALID_MESSAGE')
+  })
   it('separates account, cookie and device credentials; rejects cross-origin requests', async () => {
     expect((await request('/auth/login', 'POST', { email: account, password: 'wrong' })).status).toBe(401)
     expect((await request('/auth/login', 'POST', { email: account, password }, undefined, { Origin: 'https://attacker.example' })).status).toBe(403)
@@ -266,6 +307,7 @@ describe('account and device authorization', () => {
         const clock = vi.spyOn(Date, 'now').mockReturnValue(now)
         try {
           if (delay === 0) await api.refreshCredentials()
+          else expect((await api.authenticate(identity)).accessTokenExpiresAt).toBeGreaterThan(now)
           await expect(api.listDevices()).resolves.toEqual([])
           const recovered = await credentials.load(base, identity.deviceId)
           expect(recovered?.refreshToken).not.toBe(before?.refreshToken)
@@ -283,19 +325,49 @@ describe('account and device authorization', () => {
   })
 })
 describe('control authorization and encrypted relay', () => {
+  it('requires the complete native origin when NetStack omits the WebSocket port', async () => {
+    const hint = 'X-DSH-Native-Origin: http://localhost:8080'
+    await runScenarios([
+      { name: 'browser-same-origin', headers: ['Origin: http://localhost:8080'], status: 101 },
+      { name: 'native-without-origin', headers: [], status: 101 },
+      { name: 'harmony-with-complete-origin', headers: ['Origin: http://localhost', hint], status: 101 },
+      { name: 'missing-native-header', headers: ['Origin: http://localhost'], status: 403 },
+      { name: 'wrong-native-port', headers: ['Origin: http://localhost', 'X-DSH-Native-Origin: http://localhost:8081'], status: 403 },
+      { name: 'wrong-origin-host', headers: ['Origin: http://example.test', hint], status: 403 },
+      { name: 'wrong-origin-scheme', headers: ['Origin: https://localhost', hint], status: 403 },
+      { name: 'duplicate-native-header', headers: ['Origin: http://localhost', hint, hint], status: 403 },
+    ].map(({ name, headers, status }) => ({
+      name,
+      run: async () => {
+        expect(await rawStatus([
+          'Upgrade: websocket',
+          'Sec-WebSocket-Version: 13',
+          'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==',
+          ...headers,
+        ], '/ws/v1/connect')).toBe(status)
+      },
+    })))
+  })
+
   it('rejects invalid Control messages at the WebSocket boundary', async () => {
-    await runScenarios(['unsupported-version', 'binary-control', 'oversized-control', 'unknown-frame-type'].map(reason => ({
+    await runScenarios(['unsupported-version', 'binary-control', 'oversized-control', 'unknown-frame-type', 'duplicate-payload-field', 'noncanonical-handshake'].map(reason => ({
       name: reason,
       run: async () => {
         const wire = await socket(await device())
         await wire.next('hello.ack')
         const closed = once(wire.ws, 'close')
         const frame = {
-          ...createControlFrame('ping', { nonce: reason === 'oversized-control' ? 'a'.repeat(MAX_CONTROL_FRAME_BYTES) : 'test' }),
+          ...createControlFrame(reason === 'noncanonical-handshake' ? 'secure.handshake' : 'ping',
+            reason === 'noncanonical-handshake'
+              ? { connectionId: randomUUID(), targetDeviceId: randomUUID(), step: 1, data: 'AQIDBB' }
+              : { nonce: reason === 'oversized-control' ? 'a'.repeat(MAX_CONTROL_FRAME_BYTES) : 'test' }),
           ...(reason === 'unsupported-version' ? { v: 2 } : {}),
           ...(reason === 'unknown-frame-type' ? { type: 'unknown' } : {}),
         }
-        wire.ws.send(JSON.stringify(frame), { binary: reason === 'binary-control' })
+        const encoded = JSON.stringify(frame)
+        wire.ws.send(reason === 'duplicate-payload-field'
+          ? encoded.replace('"nonce":', '"nonce":"other","nonce":')
+          : encoded, { binary: reason === 'binary-control' })
         expect((await wire.next('error')).code).toBe(reason === 'unsupported-version' ? 'UNSUPPORTED_VERSION' : 'INVALID_MESSAGE')
         expect((await closed)[0]).toBe(4001)
       },
@@ -457,11 +529,13 @@ describe('webrtc signaling and TURN credentials', () => {
     expect(await partial.next('hello.ack')).toMatchObject({
       capabilities: ['transport.p2p', 'transport.relay'],
       webrtcEnabled: true,
-      webrtcFallbackTimeoutMs: 12_000,
+      webrtcFallbackTimeoutMs: 3_000,
     })
     const withoutTurn = await socket(await device(), { capabilities: fullCapabilities })
     expect(await withoutTurn.next('hello.ack')).toMatchObject({
       capabilities: ['transport.lan', 'transport.p2p', 'transport.relay'],
+      webrtcEnabled: true,
+      webrtcFallbackTimeoutMs: 3_000,
     })
     await app.close()
     // Without any STUN/TURN deployment the Server keeps the documented
@@ -486,7 +560,25 @@ describe('webrtc signaling and TURN credentials', () => {
     })
     accountToken = (await request('/auth/login', 'POST', { email: account, password })).data.token
     const withTurn = await socket(await device(), { capabilities: fullCapabilities })
-    expect(await withTurn.next('hello.ack')).toMatchObject({ capabilities: fullCapabilities })
+    expect(await withTurn.next('hello.ack')).toMatchObject({
+      capabilities: fullCapabilities,
+      webrtcEnabled: true,
+      webrtcFallbackTimeoutMs: 12_000,
+    })
+  })
+
+  it('disables WebRTC when negotiation leaves only relay (#449)', async () => {
+    for (const capabilities of [['transport.relay'], ['transport.turn', 'transport.relay']]) {
+      const wire = await socket(await device(), { capabilities })
+      expect(await wire.next('hello.ack')).toMatchObject({
+        capabilities: ['transport.relay'], webrtcEnabled: false,
+      })
+    }
+    const lan = await socket(await device(), { capabilities: ['transport.lan', 'transport.relay'] })
+    expect(await lan.next('hello.ack')).toMatchObject({
+      webrtcEnabled: true,
+      webrtcFallbackTimeoutMs: 3_000,
+    })
   })
 
   it('forwards ordered WebRTC signaling and transport selection', async () => {
@@ -600,7 +692,15 @@ describe('webrtc signaling and TURN credentials', () => {
     expect((await request('/turn/credentials', 'GET', undefined, ctx.c.accessToken)).status).toBe(400)
 
     await handshake(ctx)
-    expect((await request(`/turn/credentials?connection_id=${ctx.connectionId}`, 'GET', undefined, ctx.c.accessToken)).status).toBe(404)
+    // WebRTC-capable ready links remain eligible for post-authentication in-band upgrades (`remote.transport.upgrade.v1`),
+    // while strangers and strictly relay-only ready links are still rejected.
+    expect((await request(`/turn/credentials?connection_id=${ctx.connectionId}`, 'GET', undefined, ctx.c.accessToken)).status).toBe(200)
+    expect((await request(`/turn/credentials?connection_id=${ctx.connectionId}`, 'GET', undefined, ctx.h.accessToken)).status).toBe(200)
+    expect((await request(`/turn/credentials?connection_id=${ctx.connectionId}`, 'GET', undefined, stranger.accessToken)).status).toBe(404)
+
+    const relayOnlyCtx = await connection({ hostCapabilities: ['transport.relay'], clientCapabilities: ['transport.relay'], preferredTransports: ['relay'] })
+    await handshake(relayOnlyCtx)
+    expect((await request(`/turn/credentials?connection_id=${relayOnlyCtx.connectionId}`, 'GET', undefined, relayOnlyCtx.c.accessToken)).status).toBe(404)
   })
 
   it('issues configured static TURN credentials', async () => {
@@ -1364,5 +1464,127 @@ describe('stale link frame dropping and configurable rate limit', () => {
     })
     const [closeCode] = await noisyClosed
     expect(closeCode).toBe(4001)
+  })
+
+  it('preserves TURN in preferredTransports under relayFirst and authorizes post-handshake TURN credentials to both peers of the live connection', async () => {
+    await app.close()
+    await start(password, [], {
+      ice: {
+        stunUrls: ['stun:stun.example.test:3478'],
+        turnUrls: ['turn:turn.example.test:3478'],
+        turnSecret: 'test-turn-secret',
+        turnUsername: undefined,
+        turnPassword: undefined,
+        turnTtlSeconds: 120,
+      },
+    })
+    accountToken = (await request('/auth/login', 'POST', { email: account, password })).data.token
+    const h = await device('host')
+    const c = await device('client')
+    const stranger = await device('client')
+    const hostWire = await socket(h)
+    await hostWire.next('hello.ack')
+
+    const prevWs = (globalThis as Record<string, unknown>).WebSocket
+    ;(globalThis as Record<string, unknown>).WebSocket = WebSocket
+    try {
+      const adaptive = new AdaptiveTransport(`${base.replace('http', 'ws')}/ws/v1/connect`, {
+        role: 'client',
+        deviceId: c.deviceId,
+        accessToken: c.accessToken,
+        targetDeviceId: h.deviceId,
+        relayFirst: true,
+        preferredTransports: ['p2p', 'turn', 'relay'],
+      })
+      const connectPromise = adaptive.connect()
+      const incoming = await hostWire.next('connect.incoming')
+      // Relay-first still forwards 'turn' in preferredTransports to the Host!
+      expect(incoming.preferredTransports).toEqual(['p2p', 'turn', 'relay'])
+      hostWire.send('connect.accepted', { connectionId: incoming.connectionId })
+      const selected = await hostWire.next('transport.selected')
+      expect(selected.transport).toBe('relay')
+      await connectPromise
+
+      // Complete full Noise IK handshake -> link enters 'ready' stage on Server
+      const clientNoise = new NoiseIkSession({ role: 'initiator', localPrivateKey: c.keys.privateKey, localPublicKey: c.keys.publicKey, remotePublicKey: h.keys.publicKey, prologue: createNoisePrologue(incoming.connectionId, h.deviceId, c.deviceId) })
+      const hostNoise = new NoiseIkSession({ role: 'responder', localPrivateKey: h.keys.privateKey, localPublicKey: h.keys.publicKey, remotePublicKey: c.keys.publicKey, prologue: createNoisePrologue(incoming.connectionId, h.deviceId, c.deviceId) })
+      noiseSessions.push(clientNoise, hostNoise)
+      const hsDone = new Promise<void>(resolve => {
+        adaptive.onHandshake((step, data) => { if (step === 2) { clientNoise.readHandshake(data); resolve() } })
+      })
+      await adaptive.sendHandshake(1, clientNoise.writeHandshake())
+      const hs1 = await hostWire.next('secure.handshake')
+      hostNoise.readHandshake(fromBase64Url(hs1.data))
+      hostWire.send('secure.handshake', { connectionId: incoming.connectionId, targetDeviceId: c.deviceId, step: 2, data: toBase64Url(hostNoise.writeHandshake()) })
+      await hsDone
+
+      // Post-handshake ICE credentials succeed for both Client and Host, keep TURN servers (not stripped to stunOnly), and reject strangers!
+      const clientTurn = await request(`/turn/credentials?connection_id=${incoming.connectionId}`, 'GET', undefined, c.accessToken)
+      const hostTurn = await request(`/turn/credentials?connection_id=${incoming.connectionId}`, 'GET', undefined, h.accessToken)
+      expect(clientTurn.status).toBe(200)
+      expect(hostTurn.status).toBe(200)
+      const hostFiltered = incoming.preferredTransports.includes('turn') ? hostTurn.data.iceServers : stunOnlyIceServers(hostTurn.data.iceServers)
+      expect(hostFiltered.some((s: { urls: string }) => s.urls.startsWith('turn:'))).toBe(true)
+      expect((await request(`/turn/credentials?connection_id=${incoming.connectionId}`, 'GET', undefined, stranger.accessToken)).status).toBe(404)
+
+      await adaptive.close()
+    } finally {
+      ;(globalThis as Record<string, unknown>).WebSocket = prevWs
+    }
+  })
+
+  it('accepts a delayed pong for the previous ping nonce while rejecting stale or replayed nonces', async () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] })
+    try {
+      await app.close()
+      await start(password, [], { heartbeatIntervalMs: 25_000, heartbeatDisconnectMs: 75_000 })
+      accountToken = (await request('/auth/login', 'POST', { email: account, password })).data.token
+      const d = await device()
+      const wire = await socket(d)
+      await wire.next('hello.ack')
+      const peer = app.gateway.peers.get(d.deviceId)!
+
+      // Two consecutive pings arrive across a jitter boundary before the client answers the first.
+      vi.advanceTimersByTime(25_000)
+      const ping1 = await wire.next('ping')
+      vi.advanceTimersByTime(25_000)
+      const ping2 = await wire.next('ping')
+
+      const baseline = Date.now() - 30_000
+      peer.lastPong = baseline
+      wire.send('pong', { nonce: ping1.nonce })
+      wire.send('ping', { nonce: 'sync-1' })
+      await wire.next('pong')
+      expect(peer.lastPong).toBeGreaterThan(baseline)
+
+      // Replaying the already-consumed previous nonce must not refresh lastPong again.
+      peer.lastPong = baseline
+      wire.send('pong', { nonce: ping1.nonce })
+      wire.send('ping', { nonce: 'sync-2' })
+      await wire.next('pong')
+      expect(peer.lastPong).toBe(baseline)
+
+      // The second ping nonce remains valid and refreshes lastPong.
+      wire.send('pong', { nonce: ping2.nonce })
+      wire.send('ping', { nonce: 'sync-3' })
+      await wire.next('pong')
+      expect(peer.lastPong).toBeGreaterThan(baseline)
+
+      // After three new pings, the oldest nonce has been evicted from the 2-nonce window.
+      vi.advanceTimersByTime(25_000)
+      const ping3 = await wire.next('ping')
+      vi.advanceTimersByTime(25_000)
+      await wire.next('ping')
+      vi.advanceTimersByTime(25_000)
+      await wire.next('ping')
+
+      peer.lastPong = baseline
+      wire.send('pong', { nonce: ping3.nonce })
+      wire.send('ping', { nonce: 'sync-4' })
+      await wire.next('pong')
+      expect(peer.lastPong).toBe(baseline)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
