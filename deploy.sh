@@ -141,6 +141,34 @@ if [[ $VERIFY -eq 1 ]]; then
   fi
 fi
 
+
+# --- 镜像自动清理 -----------------------------------------------------------
+# 本机与目标机都随部署堆积旧 tag；每仓库只保留最新 KEEP_IMAGES（默认 2）个 tag
+# （当前版 + 1 个回滚版），仍被容器引用的删除会被 docker 拒绝并安全跳过，
+# 最后回收悬空层。设 KEEP_IMAGES=0 可只清悬空层不删 tag。
+KEEP_IMAGES="${KEEP_IMAGES:-2}"
+cleanup_repo() { # <docker 命令前缀> <repo>
+  local prefix="$1" repo="$2" keep="${KEEP_IMAGES:-2}" tag n=0 removed=0 tags
+  tags="$(${prefix:+$prefix }docker images --format '{{.CreatedAt}}|{{.Tag}}' "$repo" 2>/dev/null | sort -t'|' -k1,1 -r || true)"
+  [[ -n "$tags" ]] || return 0
+  while IFS='|' read -r _s _ tag; do
+    [[ -n "$tag" ]] || continue
+    n=$((n+1)); [ "$n" -le "$keep" ] && continue
+    if ${prefix:+$prefix }docker rmi "$repo:$tag" >/dev/null 2>&1; then
+      log "镜像清理：已删除旧镜像 $repo:$tag"; removed=$((removed+1))
+    else
+      log "镜像清理：跳过 $repo:$tag（仍被容器引用或删除被拒）"
+    fi
+  done <<< "$tags"
+  [ "$removed" -gt 0 ] && log "镜像清理：$repo 共删除 $removed 个旧 tag（保留最新 $keep 个）"
+  return 0
+}
+cleanup_repo "" "dsh-remote-server"
+docker image prune -f >/dev/null 2>&1 || true
+docker builder prune -f --keep-storage=2GB >/dev/null 2>&1 || true  # 构建缓存封顶
+log "远端镜像清理（保留最新 $KEEP_IMAGES 个 tag）"
+cleanup_repo "ssh \"$SSH_TARGET\"" "dsh-remote-server"
+ssh "$SSH_TARGET" "docker image prune -f" >/dev/null 2>&1 || true
 log "发布完成：$IMAGE"
 [[ -n "$PREV_IMAGE" && "$PREV_IMAGE" != "$IMAGE" ]] && echo "   回滚：ssh $SSH_TARGET \"sed -i 's|^    image: .*|    image: $PREV_IMAGE|' $REMOTE_DIR/compose.yaml && cd $REMOTE_DIR && docker compose up -d --force-recreate server\""
 echo "   日志：ssh $SSH_TARGET 'cd $REMOTE_DIR && docker compose logs -f --tail 100 server'"
